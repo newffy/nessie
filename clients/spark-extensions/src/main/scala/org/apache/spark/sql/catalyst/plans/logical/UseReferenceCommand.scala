@@ -22,7 +22,8 @@ case class UseReferenceCommand(
     branch: String,
     timestampOrHash: Option[String],
     catalog: Option[String]
-) extends Command {
+) extends Command
+    with LeafCommand {
 
   override lazy val output: Seq[Attribute] = new StructType(
     Array[StructField](

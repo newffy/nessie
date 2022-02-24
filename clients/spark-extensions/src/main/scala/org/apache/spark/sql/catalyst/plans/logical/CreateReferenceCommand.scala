@@ -27,7 +27,8 @@ case class CreateReferenceCommand(
     catalog: Option[String],
     fromReference: Option[String],
     failOnCreate: Boolean
-) extends Command {
+) extends Command
+    with LeafCommand {
 
   override lazy val output: Seq[Attribute] = new StructType(
     Array[StructField](

@@ -43,8 +43,8 @@
     </dependency>
     <dependency>
       <groupId>org.apache.spark</groupId>
-      <artifactId>spark-hive_2.12</artifactId>
-      <version>${spark3.version}</version>
+      <artifactId>spark-hive_2.13</artifactId>
+      <version>${spark32.version}</version>
       <scope>provided</scope>
       <exclusions>
         <exclusion>
@@ -63,7 +63,7 @@
     </dependency>
     <dependency>
       <groupId>org.apache.iceberg</groupId>
-      <artifactId>iceberg-spark3-runtime</artifactId>
+      <artifactId>iceberg-spark-runtime-3.2_2.13</artifactId>
       <scope>test</scope>
     </dependency>
     <dependency>
@@ -124,6 +124,9 @@
               <goal>add-source</goal>
               <goal>compile</goal>
             </goals>
+            <configuration>
+              <scalaVersion>${scala2.13.version}</scalaVersion>
+            </configuration>
           </execution>
           <execution>
             <id>scala-test-compile</id>
@@ -131,6 +134,9 @@
             <goals>
               <goal>testCompile</goal>
             </goals>
+            <configuration>
+              <scalaVersion>${scala2.13.version}</scalaVersion>
+            </configuration>
           </execution>
         </executions>
       </plugin>
@@ -247,11 +253,6 @@
           <plugin>
             <groupId>org.apache.maven.plugins</groupId>
             <artifactId>maven-failsafe-plugin</artifactId>
-            <configuration>
-              <jdkToolchain>
-                <version>11</version>
-              </jdkToolchain>
-            </configuration>
           </plugin>
         </plugins>
       </build>
@@ -270,7 +271,7 @@
                   <goal>doc-jar</goal>
                 </goals>
                 <configuration>
-                  <scalaVersion>${scala2.12.version}</scalaVersion>
+                  <scalaVersion>${scala2.13.version}</scalaVersion>
                   <additionalDependencies>
                     <!-- Hack to let scaladoc pick up the generated code -->
                     <dependency>

@@ -32,8 +32,8 @@
   <dependencies>
     <dependency>
       <groupId>org.apache.spark</groupId>
-      <artifactId>spark-sql_2.12</artifactId>
-      <version>${spark3.version}</version>
+      <artifactId>spark-sql_2.13</artifactId>
+      <version>${spark32.version}</version>
       <scope>provided</scope>
       <exclusions>
         <exclusion>
@@ -44,9 +44,15 @@
     </dependency>
     <dependency>
       <groupId>org.apache.spark</groupId>
-      <artifactId>spark-core_2.12</artifactId>
-      <version>${spark3.version}</version>
+      <artifactId>spark-core_2.13</artifactId>
+      <version>${spark32.version}</version>
       <scope>provided</scope>
+      <exclusions>
+        <exclusion>
+          <groupId>commons-logging</groupId>
+          <artifactId>commons-logging</artifactId>
+        </exclusion>
+      </exclusions>
     </dependency>
 
     <dependency>

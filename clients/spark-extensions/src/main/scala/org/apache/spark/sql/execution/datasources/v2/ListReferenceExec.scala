@@ -43,6 +43,7 @@ case class ListReferenceExec(
           UTF8String.fromString(ref.getHash)
         )
       })
+      .toSeq
   }
 
   override def simpleString(maxFields: Int): String = {

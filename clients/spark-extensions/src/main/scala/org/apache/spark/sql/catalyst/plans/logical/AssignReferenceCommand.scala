@@ -24,7 +24,8 @@ case class AssignReferenceCommand(
     toRefName: Option[String],
     toHash: Option[String],
     catalog: Option[String]
-) extends Command {
+) extends Command
+    with LeafCommand {
 
   override lazy val output: Seq[Attribute] = new StructType(
     Array[StructField](

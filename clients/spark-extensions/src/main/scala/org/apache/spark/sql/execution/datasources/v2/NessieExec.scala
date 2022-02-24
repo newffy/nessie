@@ -21,7 +21,8 @@ import org.projectnessie.client.api.NessieApiV1
 abstract class NessieExec(
     currentCatalog: CatalogPlugin,
     catalog: Option[String]
-) extends V2CommandExec {
+) extends V2CommandExec
+    with LeafV2CommandExec {
 
   protected def runInternal(api: NessieApiV1): Seq[InternalRow]
 
