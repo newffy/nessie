@@ -38,6 +38,7 @@ import org.junit.jupiter.api.Test;
 import org.projectnessie.client.api.NessieApiV1;
 import org.projectnessie.client.http.HttpClientBuilder;
 import org.projectnessie.client.tests.AbstractSparkTest;
+import org.projectnessie.error.NessieBadRequestException;
 import org.projectnessie.error.NessieConflictException;
 import org.projectnessie.error.NessieNotFoundException;
 import org.projectnessie.model.Branch;
@@ -384,10 +385,9 @@ public class ITNessieStatements extends AbstractSparkTest {
                 "Invalid timestamp provided: Text '%s' could not be parsed", invalidTimestamp));
 
     assertThatThrownBy(() -> sql("USE REFERENCE %s AT %s IN nessie ", refName, invalidHash))
-        .isInstanceOf(NessieNotFoundException.class)
+        .isInstanceOf(NessieBadRequestException.class)
         .hasMessageStartingWith(
-            String.format(
-                "Invalid timestamp provided: Text '%s' could not be parsed", invalidHash));
+            "Bad Request (HTTP/400): hash length needs to be a multiple of two, was 9");
   }
 
   @Test
