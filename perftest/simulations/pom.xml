@@ -22,7 +22,7 @@
   <parent>
     <groupId>org.projectnessie</groupId>
     <artifactId>nessie-perftest</artifactId>
-    <version>0.20.2-SNAPSHOT</version>
+    <version>0.21.3-SNAPSHOT</version>
   </parent>
 
   <artifactId>nessie-perftest-simulations</artifactId>
@@ -48,7 +48,6 @@
       <plugin>
         <groupId>org.projectnessie</groupId>
         <artifactId>nessie-apprunner-maven-plugin</artifactId>
-        <version>${project.version}</version>
         <configuration>
           <skip>${skipITs}</skip>
           <systemProperties>

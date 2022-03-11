@@ -24,7 +24,9 @@ import static org.projectnessie.versioned.persist.adapter.spi.DatabaseAdapterUti
 import static org.projectnessie.versioned.persist.adapter.spi.DatabaseAdapterUtil.referenceNotFound;
 import static org.projectnessie.versioned.persist.adapter.spi.DatabaseAdapterUtil.takeUntilExcludeLast;
 import static org.projectnessie.versioned.persist.adapter.spi.DatabaseAdapterUtil.takeUntilIncludeLast;
+import static org.projectnessie.versioned.persist.adapter.spi.Traced.trace;
 
+import com.google.common.base.Preconditions;
 import com.google.common.hash.Hasher;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.UnsafeByteOperations;
@@ -109,6 +111,10 @@ import org.projectnessie.versioned.persist.adapter.RefLog;
 public abstract class AbstractDatabaseAdapter<OP_CONTEXT, CONFIG extends DatabaseAdapterConfig>
     implements DatabaseAdapter {
 
+  private static final Function<Hash, CommitLogEntry> NO_IN_MEMORY_COMMITS = hash -> null;
+
+  protected static final String TAG_HASH = "hash";
+  protected static final String TAG_COUNT = "count";
   protected final CONFIG config;
   protected final ContentVariantSupplier contentVariantSupplier;
 
@@ -161,6 +167,11 @@ public abstract class AbstractDatabaseAdapter<OP_CONTEXT, CONFIG extends Databas
       throws ReferenceNotFoundException, ReferenceConflictException {
     List<String> mismatches = new ArrayList<>();
 
+    Runnable validator = commitAttempt.getValidator();
+    if (validator != null) {
+      validator.run();
+    }
+
     // verify expected global-states
     checkExpectedGlobalStates(ctx, commitAttempt, mismatches::add);
 
@@ -194,7 +205,8 @@ public abstract class AbstractDatabaseAdapter<OP_CONTEXT, CONFIG extends Databas
             commitAttempt.getPuts(),
             commitAttempt.getDeletes(),
             currentBranchEntry != null ? currentBranchEntry.getKeyListDistance() : 0,
-            newKeyLists);
+            newKeyLists,
+            NO_IN_MEMORY_COMMITS);
     writeIndividualCommit(ctx, newBranchCommit);
     return newBranchCommit;
   }
@@ -626,32 +638,113 @@ public abstract class AbstractDatabaseAdapter<OP_CONTEXT, CONFIG extends Databas
   }
 
   /** Load the commit-log entry for the given hash, return {@code null}, if not found. */
-  protected abstract CommitLogEntry fetchFromCommitLog(OP_CONTEXT ctx, Hash hash);
+  protected final CommitLogEntry fetchFromCommitLog(OP_CONTEXT ctx, Hash hash) {
+    try (Traced ignore = trace("fetchFromCommitLog").tag(TAG_HASH, hash.asString())) {
+      return doFetchFromCommitLog(ctx, hash);
+    }
+  }
+
+  protected abstract CommitLogEntry doFetchFromCommitLog(OP_CONTEXT ctx, Hash hash);
 
   /**
    * Fetch multiple {@link CommitLogEntry commit-log-entries} from the commit-log. The returned list
    * must have exactly as many elements as in the parameter {@code hashes}. Non-existing hashes are
    * returned as {@code null}.
    */
-  protected abstract List<CommitLogEntry> fetchPageFromCommitLog(OP_CONTEXT ctx, List<Hash> hashes);
+  private List<CommitLogEntry> fetchMultipleFromCommitLog(OP_CONTEXT ctx, List<Hash> hashes) {
+    if (hashes.isEmpty()) {
+      return Collections.emptyList();
+    }
+    try (Traced ignore =
+        trace("fetchPageFromCommitLog")
+            .tag(TAG_HASH, hashes.get(0).asString())
+            .tag(TAG_COUNT, hashes.size())) {
+      return doFetchMultipleFromCommitLog(ctx, hashes);
+    }
+  }
+
+  private List<CommitLogEntry> fetchMultipleFromCommitLog(
+      OP_CONTEXT ctx, List<Hash> hashes, @Nonnull Function<Hash, CommitLogEntry> inMemoryCommits) {
+    List<CommitLogEntry> result = new ArrayList<>(hashes.size());
+    List<Hash> remainingHashes = new ArrayList<>(hashes.size());
+    List<Integer> remainingIndexes = new ArrayList<>(hashes.size());
+
+    // Prefetch commits already available in memory. Record indexes for the missing commits to
+    // enable placing them in the correct positions later, when they are fetched from storage.
+    int idx = 0;
+    for (Hash hash : hashes) {
+      CommitLogEntry found = inMemoryCommits.apply(hash);
+      if (found != null) {
+        result.add(found);
+      } else {
+        result.add(null); // to be replaced with storage result below
+        remainingHashes.add(hash);
+        remainingIndexes.add(idx);
+      }
+      idx++;
+    }
+
+    if (!remainingHashes.isEmpty()) {
+      List<CommitLogEntry> fromStorage = fetchMultipleFromCommitLog(ctx, remainingHashes);
+      // Fill the gaps in the final result list. Note that fetchPageFromCommitLog must return the
+      // list of the same size as its `remainingHashes` parameter.
+      idx = 0;
+      for (CommitLogEntry entry : fromStorage) {
+        int i = remainingIndexes.get(idx++);
+        result.set(i, entry);
+      }
+    }
+
+    return result;
+  }
+
+  protected abstract List<CommitLogEntry> doFetchMultipleFromCommitLog(
+      OP_CONTEXT ctx, List<Hash> hashes);
 
   /** Reads from the commit-log starting at the given commit-log-hash. */
   protected Stream<CommitLogEntry> readCommitLogStream(OP_CONTEXT ctx, Hash initialHash)
       throws ReferenceNotFoundException {
-    Spliterator<CommitLogEntry> split = readCommitLog(ctx, initialHash);
+    Spliterator<CommitLogEntry> split = readCommitLog(ctx, initialHash, NO_IN_MEMORY_COMMITS);
     return StreamSupport.stream(split, false);
   }
 
-  protected Spliterator<CommitLogEntry> readCommitLog(OP_CONTEXT ctx, Hash initialHash)
+  protected Stream<CommitLogEntry> readCommitLogStream(
+      OP_CONTEXT ctx, Hash initialHash, @Nonnull Function<Hash, CommitLogEntry> inMemoryCommits)
       throws ReferenceNotFoundException {
+    Spliterator<CommitLogEntry> split = readCommitLog(ctx, initialHash, inMemoryCommits);
+    return StreamSupport.stream(split, false);
+  }
+
+  protected Spliterator<CommitLogEntry> readCommitLog(
+      OP_CONTEXT ctx, Hash initialHash, @Nonnull Function<Hash, CommitLogEntry> inMemoryCommits)
+      throws ReferenceNotFoundException {
+    Preconditions.checkNotNull(inMemoryCommits, "in-memory commits cannot be null");
+
     if (NO_ANCESTOR.equals(initialHash)) {
       return Spliterators.emptySpliterator();
     }
-    CommitLogEntry initial = fetchFromCommitLog(ctx, initialHash);
+
+    CommitLogEntry initial = inMemoryCommits.apply(initialHash);
+    if (initial == null) {
+      initial = fetchFromCommitLog(ctx, initialHash);
+    }
+
     if (initial == null) {
       throw referenceNotFound(initialHash);
     }
-    return logFetcher(ctx, initial, this::fetchPageFromCommitLog, CommitLogEntry::getParents);
+
+    BiFunction<OP_CONTEXT, List<Hash>, List<CommitLogEntry>> fetcher;
+    // Avoid creating unnecessary transient lists for the common case of fetching old commits from
+    // storage.
+    // Note: == comparison is fine in this situation because the "in memory" function is local to
+    // this class both for the empty and in the non-empty cases.
+    if (inMemoryCommits == NO_IN_MEMORY_COMMITS) {
+      fetcher = this::fetchMultipleFromCommitLog;
+    } else {
+      fetcher = (c, hashes) -> fetchMultipleFromCommitLog(c, hashes, inMemoryCommits);
+    }
+
+    return logFetcher(ctx, initial, fetcher, CommitLogEntry::getParents);
   }
 
   /**
@@ -688,6 +781,22 @@ public abstract class AbstractDatabaseAdapter<OP_CONTEXT, CONFIG extends Databas
       T initial,
       BiFunction<OP_CONTEXT, List<Hash>, List<T>> fetcher,
       Function<T, List<Hash>> nextPage) {
+    return logFetcherCommon(ctx, Collections.singletonList(initial), fetcher, nextPage);
+  }
+
+  protected <T> Spliterator<T> logFetcherWithPage(
+      OP_CONTEXT ctx,
+      List<Hash> initialPage,
+      BiFunction<OP_CONTEXT, List<Hash>, List<T>> fetcher,
+      Function<T, List<Hash>> nextPage) {
+    return logFetcherCommon(ctx, fetcher.apply(ctx, initialPage), fetcher, nextPage);
+  }
+
+  private <T> Spliterator<T> logFetcherCommon(
+      OP_CONTEXT ctx,
+      List<T> initial,
+      BiFunction<OP_CONTEXT, List<Hash>, List<T>> fetcher,
+      Function<T, List<Hash>> nextPage) {
     return new AbstractSpliterator<T>(Long.MAX_VALUE, 0) {
       private Iterator<T> currentBatch;
       private boolean eof;
@@ -698,7 +807,7 @@ public abstract class AbstractDatabaseAdapter<OP_CONTEXT, CONFIG extends Databas
         if (eof) {
           return false;
         } else if (currentBatch == null) {
-          currentBatch = Collections.singletonList(initial).iterator();
+          currentBatch = initial.iterator();
         } else if (!currentBatch.hasNext()) {
           if (previous == null) {
             eof = true;
@@ -737,7 +846,8 @@ public abstract class AbstractDatabaseAdapter<OP_CONTEXT, CONFIG extends Databas
       List<KeyWithBytes> puts,
       List<Key> deletes,
       int currentKeyListDistance,
-      Consumer<Hash> newKeyLists)
+      Consumer<Hash> newKeyLists,
+      @Nonnull Function<Hash, CommitLogEntry> inMemoryCommits)
       throws ReferenceNotFoundException {
     Hash commitHash = individualCommitHash(parentHashes, commitMeta, puts, deletes);
 
@@ -757,7 +867,7 @@ public abstract class AbstractDatabaseAdapter<OP_CONTEXT, CONFIG extends Databas
             Collections.emptyList());
 
     if (keyListDistance >= config.getKeyListDistance()) {
-      entry = buildKeyList(ctx, entry, newKeyLists);
+      entry = buildKeyList(ctx, entry, newKeyLists, inMemoryCommits);
     }
     return entry;
   }
@@ -780,7 +890,7 @@ public abstract class AbstractDatabaseAdapter<OP_CONTEXT, CONFIG extends Databas
     return Hash.of(UnsafeByteOperations.unsafeWrap(hasher.hash().asBytes()));
   }
 
-  /** Helper object for {@link #buildKeyList(Object, CommitLogEntry, Consumer)}. */
+  /** Helper object for {@link #buildKeyList(Object, CommitLogEntry, Consumer, Function)}. */
   private static class KeyListBuildState {
     final ImmutableCommitLogEntry.Builder newCommitEntry;
     /** Builder for {@link CommitLogEntry#getKeyList()}. */
@@ -843,7 +953,10 @@ public abstract class AbstractDatabaseAdapter<OP_CONTEXT, CONFIG extends Databas
    * to both read and re-write those rows for {@link KeyListEntity}.
    */
   protected CommitLogEntry buildKeyList(
-      OP_CONTEXT ctx, CommitLogEntry unwrittenEntry, Consumer<Hash> newKeyLists)
+      OP_CONTEXT ctx,
+      CommitLogEntry unwrittenEntry,
+      Consumer<Hash> newKeyLists,
+      @Nonnull Function<Hash, CommitLogEntry> inMemoryCommits)
       throws ReferenceNotFoundException {
     // Read commit-log until the previous persisted key-list
 
@@ -856,7 +969,7 @@ public abstract class AbstractDatabaseAdapter<OP_CONTEXT, CONFIG extends Databas
     KeyListBuildState buildState =
         new KeyListBuildState(entitySize(unwrittenEntry), newCommitEntry);
 
-    keysForCommitEntry(ctx, startHash)
+    keysForCommitEntry(ctx, startHash, inMemoryCommits)
         .forEach(
             keyWithType -> {
               int keyTypeSize = entitySize(keyWithType);
@@ -943,17 +1056,18 @@ public abstract class AbstractDatabaseAdapter<OP_CONTEXT, CONFIG extends Databas
   /** Retrieve the content-keys and their types for the commit-log-entry with the given hash. */
   protected Stream<KeyWithType> keysForCommitEntry(
       OP_CONTEXT ctx, Hash hash, KeyFilterPredicate keyFilter) throws ReferenceNotFoundException {
-    return keysForCommitEntry(ctx, hash)
+    return keysForCommitEntry(ctx, hash, NO_IN_MEMORY_COMMITS)
         .filter(kt -> keyFilter.check(kt.getKey(), kt.getContentId(), kt.getType()));
   }
 
   /** Retrieve the content-keys and their types for the commit-log-entry with the given hash. */
-  protected Stream<KeyWithType> keysForCommitEntry(OP_CONTEXT ctx, Hash hash)
+  protected Stream<KeyWithType> keysForCommitEntry(
+      OP_CONTEXT ctx, Hash hash, @Nonnull Function<Hash, CommitLogEntry> inMemoryCommits)
       throws ReferenceNotFoundException {
     // walk the commit-logs in reverse order - starting with the last persisted key-list
 
     Set<Key> seen = new HashSet<>();
-    Stream<CommitLogEntry> log = readCommitLogStream(ctx, hash);
+    Stream<CommitLogEntry> log = readCommitLogStream(ctx, hash, inMemoryCommits);
     log = takeUntilIncludeLast(log, e -> e.getKeyList() != null);
     return log.flatMap(
         e -> {
@@ -1007,7 +1121,31 @@ public abstract class AbstractDatabaseAdapter<OP_CONTEXT, CONFIG extends Databas
     Set<ContentId> contentIdsForGlobal = new HashSet<>();
     try (Stream<CommitLogEntry> log =
         takeUntilExcludeLast(readCommitLogStream(ctx, refHead), e -> remainingKeys.isEmpty())) {
-      log.peek(entry -> entry.getDeletes().forEach(remainingKeys::remove))
+      log.peek(
+              entry -> {
+                // remove deleted keys from keys to look for
+                entry.getDeletes().forEach(remainingKeys::remove);
+
+                if (entry.getKeyList() != null) {
+                  // CommitLogEntry has a KeyList.
+                  // All keys in 'remainingKeys', that are _not_ in the KeyList(s), can be removed,
+                  // because at this point we know that these do not exist.
+
+                  Set<Key> remainingInKeyList = new HashSet<>();
+                  try (Stream<KeyList> keyLists =
+                      Stream.concat(
+                          Stream.of(entry.getKeyList()),
+                          fetchKeyLists(ctx, entry.getKeyListsIds()).map(KeyListEntity::getKeys))) {
+                    keyLists
+                        .flatMap(kl -> kl.getKeys().stream())
+                        .map(KeyWithType::getKey)
+                        .filter(remainingKeys::contains)
+                        .forEach(remainingInKeyList::add);
+                  }
+
+                  remainingKeys.retainAll(remainingInKeyList);
+                }
+              })
           .flatMap(entry -> entry.getPuts().stream())
           .filter(put -> remainingKeys.remove(put.getKey()))
           .filter(put -> keyFilter.check(put.getKey(), put.getContentId(), put.getType()))
@@ -1047,10 +1185,26 @@ public abstract class AbstractDatabaseAdapter<OP_CONTEXT, CONFIG extends Databas
    * @param contentIds the content-ids to fetch
    * @return map of content-id to state
    */
-  protected abstract Map<ContentId, ByteString> fetchGlobalStates(
+  protected final Map<ContentId, ByteString> fetchGlobalStates(
+      OP_CONTEXT ctx, Set<ContentId> contentIds) throws ReferenceNotFoundException {
+    try (Traced ignore = trace("fetchGlobalStates").tag(TAG_COUNT, contentIds.size())) {
+      return doFetchGlobalStates(ctx, contentIds);
+    }
+  }
+
+  protected abstract Map<ContentId, ByteString> doFetchGlobalStates(
       OP_CONTEXT ctx, Set<ContentId> contentIds) throws ReferenceNotFoundException;
 
-  protected abstract Stream<KeyListEntity> fetchKeyLists(OP_CONTEXT ctx, List<Hash> keyListsIds);
+  protected final Stream<KeyListEntity> fetchKeyLists(OP_CONTEXT ctx, List<Hash> keyListsIds) {
+    if (keyListsIds.isEmpty()) {
+      return Stream.empty();
+    }
+    try (Traced ignore = trace("fetchKeyLists").tag(TAG_COUNT, keyListsIds.size())) {
+      return doFetchKeyLists(ctx, keyListsIds);
+    }
+  }
+
+  protected abstract Stream<KeyListEntity> doFetchKeyLists(OP_CONTEXT ctx, List<Hash> keyListsIds);
 
   /**
    * Write a new commit-entry, the given commit entry is to be persisted as is. All values of the
@@ -1059,7 +1213,14 @@ public abstract class AbstractDatabaseAdapter<OP_CONTEXT, CONFIG extends Databas
    * <p>Implementations however can enforce strict consistency checks/guarantees, like a best-effort
    * approach to prevent hash-collisions but without any other consistency checks/guarantees.
    */
-  protected abstract void writeIndividualCommit(OP_CONTEXT ctx, CommitLogEntry entry)
+  protected final void writeIndividualCommit(OP_CONTEXT ctx, CommitLogEntry entry)
+      throws ReferenceConflictException {
+    try (Traced ignore = trace("writeIndividualCommit")) {
+      doWriteIndividualCommit(ctx, entry);
+    }
+  }
+
+  protected abstract void doWriteIndividualCommit(OP_CONTEXT ctx, CommitLogEntry entry)
       throws ReferenceConflictException;
 
   /**
@@ -1069,10 +1230,24 @@ public abstract class AbstractDatabaseAdapter<OP_CONTEXT, CONFIG extends Databas
    * <p>Implementations however can enforce strict consistency checks/guarantees, like a best-effort
    * approach to prevent hash-collisions but without any other consistency checks/guarantees.
    */
-  protected abstract void writeMultipleCommits(OP_CONTEXT ctx, List<CommitLogEntry> entries)
+  protected final void writeMultipleCommits(OP_CONTEXT ctx, List<CommitLogEntry> entries)
+      throws ReferenceConflictException {
+    try (Traced ignore = trace("writeMultipleCommits").tag(TAG_COUNT, entries.size())) {
+      doWriteMultipleCommits(ctx, entries);
+    }
+  }
+
+  protected abstract void doWriteMultipleCommits(OP_CONTEXT ctx, List<CommitLogEntry> entries)
       throws ReferenceConflictException;
 
-  protected abstract void writeKeyListEntities(
+  protected final void writeKeyListEntities(
+      OP_CONTEXT ctx, List<KeyListEntity> newKeyListEntities) {
+    try (Traced ignore = trace("writeKeyListEntities").tag(TAG_COUNT, newKeyListEntities.size())) {
+      doWriteKeyListEntities(ctx, newKeyListEntities);
+    }
+  }
+
+  protected abstract void doWriteKeyListEntities(
       OP_CONTEXT ctx, List<KeyListEntity> newKeyListEntities);
 
   /**
@@ -1280,6 +1455,8 @@ public abstract class AbstractDatabaseAdapter<OP_CONTEXT, CONFIG extends Databas
 
     int keyListDistance = targetHeadCommit != null ? targetHeadCommit.getKeyListDistance() : 0;
 
+    Map<Hash, CommitLogEntry> unwrittenCommits = new HashMap<>();
+
     // Rewrite commits to transplant and store those in 'commitsToTransplantReverse'
     for (int i = commitsChronological.size() - 1; i >= 0; i--, commitSeq++) {
       CommitLogEntry sourceCommit = commitsChronological.get(i);
@@ -1305,8 +1482,11 @@ public abstract class AbstractDatabaseAdapter<OP_CONTEXT, CONFIG extends Databas
               sourceCommit.getPuts(),
               sourceCommit.getDeletes(),
               keyListDistance,
-              newKeyLists);
+              newKeyLists,
+              unwrittenCommits::get);
       keyListDistance = newEntry.getKeyListDistance();
+
+      unwrittenCommits.put(newEntry.getHash(), newEntry);
 
       if (!newEntry.getHash().equals(sourceCommit.getHash())) {
         commitsChronological.set(i, newEntry);
@@ -1355,14 +1535,33 @@ public abstract class AbstractDatabaseAdapter<OP_CONTEXT, CONFIG extends Databas
   }
 
   /** Load the refLog entry for the given hash, return {@code null}, if not found. */
-  protected abstract RefLog fetchFromRefLog(OP_CONTEXT ctx, Hash refLogId);
+  protected final RefLog fetchFromRefLog(OP_CONTEXT ctx, Hash refLogId) {
+    try (Traced ignore =
+        trace("fetchFromRefLog").tag(TAG_HASH, refLogId != null ? refLogId.asString() : "HEAD")) {
+      return doFetchFromRefLog(ctx, refLogId);
+    }
+  }
+
+  protected abstract RefLog doFetchFromRefLog(OP_CONTEXT ctx, Hash refLogId);
 
   /**
    * Fetch multiple {@link RefLog refLog-entries} from the refLog. The returned list must have
    * exactly as many elements as in the parameter {@code hashes}. Non-existing hashes are returned
    * as {@code null}.
    */
-  protected abstract List<RefLog> fetchPageFromRefLog(OP_CONTEXT ctx, List<Hash> hashes);
+  protected final List<RefLog> fetchPageFromRefLog(OP_CONTEXT ctx, List<Hash> hashes) {
+    if (hashes.isEmpty()) {
+      return Collections.emptyList();
+    }
+    try (Traced ignore =
+        trace("fetchPageFromRefLog")
+            .tag(TAG_HASH, hashes.get(0).asString())
+            .tag(TAG_COUNT, hashes.size())) {
+      return doFetchPageFromRefLog(ctx, hashes);
+    }
+  }
+
+  protected abstract List<RefLog> doFetchPageFromRefLog(OP_CONTEXT ctx, List<Hash> hashes);
 
   /** Reads from the refLog starting at the given refLog-hash. */
   protected Stream<RefLog> readRefLogStream(OP_CONTEXT ctx, Hash initialHash)

@@ -29,13 +29,17 @@ import static org.projectnessie.versioned.persist.adapter.spi.DatabaseAdapterUti
 import static org.projectnessie.versioned.persist.adapter.spi.DatabaseAdapterUtil.takeUntilIncludeLast;
 import static org.projectnessie.versioned.persist.adapter.spi.DatabaseAdapterUtil.transplantConflictMessage;
 import static org.projectnessie.versioned.persist.adapter.spi.DatabaseAdapterUtil.verifyExpectedHash;
+import static org.projectnessie.versioned.persist.adapter.spi.Traced.trace;
 import static org.projectnessie.versioned.persist.adapter.spi.TryLoopState.newTryLoopState;
 import static org.projectnessie.versioned.persist.nontx.NonTransactionalOperationContext.NON_TRANSACTIONAL_OPERATION_CONTEXT;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableMap;
 import com.google.protobuf.ByteString;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -46,7 +50,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
-import java.util.function.ToIntFunction;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
@@ -68,21 +71,27 @@ import org.projectnessie.versioned.persist.adapter.CommitLogEntry;
 import org.projectnessie.versioned.persist.adapter.ContentAndState;
 import org.projectnessie.versioned.persist.adapter.ContentId;
 import org.projectnessie.versioned.persist.adapter.ContentIdAndBytes;
-import org.projectnessie.versioned.persist.adapter.ContentIdWithType;
 import org.projectnessie.versioned.persist.adapter.ContentVariantSupplier;
 import org.projectnessie.versioned.persist.adapter.Difference;
+import org.projectnessie.versioned.persist.adapter.GlobalLogCompactionParams;
 import org.projectnessie.versioned.persist.adapter.KeyFilterPredicate;
 import org.projectnessie.versioned.persist.adapter.KeyListEntity;
 import org.projectnessie.versioned.persist.adapter.KeyWithType;
 import org.projectnessie.versioned.persist.adapter.RefLog;
 import org.projectnessie.versioned.persist.adapter.RepoDescription;
+import org.projectnessie.versioned.persist.adapter.RepoMaintenanceParams;
 import org.projectnessie.versioned.persist.adapter.spi.AbstractDatabaseAdapter;
+import org.projectnessie.versioned.persist.adapter.spi.Traced;
 import org.projectnessie.versioned.persist.adapter.spi.TryLoopState;
+import org.projectnessie.versioned.persist.serialize.AdapterTypes;
 import org.projectnessie.versioned.persist.serialize.AdapterTypes.ContentIdWithBytes;
 import org.projectnessie.versioned.persist.serialize.AdapterTypes.GlobalStateLogEntry;
+import org.projectnessie.versioned.persist.serialize.AdapterTypes.GlobalStateLogEntry.Builder;
 import org.projectnessie.versioned.persist.serialize.AdapterTypes.GlobalStatePointer;
 import org.projectnessie.versioned.persist.serialize.AdapterTypes.NamedReference;
 import org.projectnessie.versioned.persist.serialize.AdapterTypes.RefLogEntry;
+import org.projectnessie.versioned.persist.serialize.AdapterTypes.RefLogEntry.Operation;
+import org.projectnessie.versioned.persist.serialize.AdapterTypes.RefLogEntry.RefType;
 import org.projectnessie.versioned.persist.serialize.AdapterTypes.RefPointer;
 import org.projectnessie.versioned.persist.serialize.AdapterTypes.RefPointer.Type;
 import org.projectnessie.versioned.persist.serialize.ProtoSerialization;
@@ -104,6 +113,9 @@ import org.projectnessie.versioned.persist.serialize.ProtoSerialization;
 public abstract class NonTransactionalDatabaseAdapter<
         CONFIG extends NonTransactionalDatabaseAdapterConfig>
     extends AbstractDatabaseAdapter<NonTransactionalOperationContext, CONFIG> {
+
+  public static final String TAG_COMMIT_COUNT = "commit-count";
+  public static final String TAG_KEY_LIST_COUNT = "key-list-count";
 
   protected NonTransactionalDatabaseAdapter(
       CONFIG config, ContentVariantSupplier contentVariantSupplier) {
@@ -195,6 +207,7 @@ public abstract class NonTransactionalDatabaseAdapter<
     // creates a new commit-tree that is decoupled from other commit-trees.
     try {
       return casOpLoop(
+          "merge",
           toBranch,
           CasOpVariant.COMMIT,
           (ctx, pointer, branchCommits, newKeyLists) -> {
@@ -214,24 +227,22 @@ public abstract class NonTransactionalDatabaseAdapter<
                     newKeyLists,
                     updateCommitMetadata);
 
-            Hash newGlobalHead =
-                writeGlobalCommit(
-                    ctx, timeInMicros, Hash.of(pointer.getGlobalId()), Collections.emptyList());
+            GlobalStateLogEntry newGlobalHead =
+                writeGlobalCommit(ctx, timeInMicros, pointer, Collections.emptyList());
 
-            Hash newRefLogId =
+            RefLogEntry newRefLog =
                 writeRefLogEntry(
                     ctx,
+                    pointer,
                     toBranch.getName(),
                     RefLogEntry.RefType.Branch,
-                    Hash.of(pointer.getRefLogId()),
                     toHead,
                     RefLogEntry.Operation.MERGE,
                     timeInMicros,
                     Collections.singletonList(from));
 
             // Return hash of last commit (toHead) added to 'targetBranch' (via the casOpLoop)
-            return updateGlobalStatePointer(
-                toBranch, pointer, toHead, newGlobalHead, newRefLogId.asBytes());
+            return updateGlobalStatePointer(toBranch, pointer, toHead, newGlobalHead, newRefLog);
           },
           () -> mergeConflictMessage("Retry-failure", from, toBranch, expectedHead));
     } catch (ReferenceNotFoundException | ReferenceConflictException | RuntimeException e) {
@@ -251,6 +262,7 @@ public abstract class NonTransactionalDatabaseAdapter<
       throws ReferenceNotFoundException, ReferenceConflictException {
     try {
       return casOpLoop(
+          "transplant",
           targetBranch,
           CasOpVariant.COMMIT,
           (ctx, pointer, branchCommits, newKeyLists) -> {
@@ -270,16 +282,15 @@ public abstract class NonTransactionalDatabaseAdapter<
                     newKeyLists,
                     updateCommitMetadata);
 
-            Hash newGlobalHead =
-                writeGlobalCommit(
-                    ctx, timeInMicros, Hash.of(pointer.getGlobalId()), Collections.emptyList());
+            GlobalStateLogEntry newGlobalHead =
+                writeGlobalCommit(ctx, timeInMicros, pointer, Collections.emptyList());
 
-            Hash newRefLogId =
+            RefLogEntry newRefLog =
                 writeRefLogEntry(
                     ctx,
+                    pointer,
                     targetBranch.getName(),
                     RefLogEntry.RefType.Branch,
-                    Hash.of(pointer.getRefLogId()),
                     targetHead,
                     RefLogEntry.Operation.TRANSPLANT,
                     timeInMicros,
@@ -287,7 +298,7 @@ public abstract class NonTransactionalDatabaseAdapter<
 
             // Return hash of last commit (targetHead) added to 'targetBranch' (via the casOpLoop)
             return updateGlobalStatePointer(
-                targetBranch, pointer, targetHead, newGlobalHead, newRefLogId.asBytes());
+                targetBranch, pointer, targetHead, newGlobalHead, newRefLog);
           },
           () ->
               transplantConflictMessage(
@@ -305,6 +316,7 @@ public abstract class NonTransactionalDatabaseAdapter<
       throws ReferenceConflictException, ReferenceNotFoundException {
     try {
       return casOpLoop(
+          "commit",
           commitAttempt.getCommitToBranch(),
           CasOpVariant.COMMIT,
           (ctx, pointer, x, newKeyLists) -> {
@@ -315,21 +327,21 @@ public abstract class NonTransactionalDatabaseAdapter<
             CommitLogEntry newBranchCommit =
                 commitAttempt(ctx, timeInMicros, branchHead, commitAttempt, newKeyLists);
 
-            Hash newGlobalHead =
+            GlobalStateLogEntry newGlobalHead =
                 writeGlobalCommit(
                     ctx,
                     timeInMicros,
-                    Hash.of(pointer.getGlobalId()),
+                    pointer,
                     commitAttempt.getGlobal().entrySet().stream()
-                        .map(e -> ContentIdAndBytes.of(e.getKey(), (byte) 0, e.getValue()))
+                        .map(e -> ContentIdAndBytes.of(e.getKey(), e.getValue()))
                         .collect(Collectors.toList()));
 
-            Hash newRefLogId =
+            RefLogEntry newRefLog =
                 writeRefLogEntry(
                     ctx,
+                    pointer,
                     commitAttempt.getCommitToBranch().getName(),
                     RefLogEntry.RefType.Branch,
-                    Hash.of(pointer.getRefLogId()),
                     newBranchCommit.getHash(),
                     RefLogEntry.Operation.COMMIT,
                     timeInMicros,
@@ -340,7 +352,7 @@ public abstract class NonTransactionalDatabaseAdapter<
                 pointer,
                 newBranchCommit.getHash(),
                 newGlobalHead,
-                newRefLogId.asBytes());
+                newRefLog);
           },
           () ->
               commitConflictMessage(
@@ -359,6 +371,7 @@ public abstract class NonTransactionalDatabaseAdapter<
       throws ReferenceAlreadyExistsException, ReferenceNotFoundException {
     try {
       return casOpLoop(
+          "createRef",
           ref,
           CasOpVariant.REF_UPDATE,
           (ctx, pointer, branchCommits, newKeyLists) -> {
@@ -376,23 +389,22 @@ public abstract class NonTransactionalDatabaseAdapter<
             validateHashExists(ctx, hash);
 
             // Need a new empty global-log entry to be able to CAS
-            Hash newGlobalHead = noopGlobalLogEntry(ctx, pointer);
+            GlobalStateLogEntry newGlobalHead = noopGlobalLogEntry(ctx, pointer);
 
             RefLogEntry.RefType refType =
                 ref instanceof TagName ? RefLogEntry.RefType.Tag : RefLogEntry.RefType.Branch;
-            Hash newRefLogId =
+            RefLogEntry newRefLog =
                 writeRefLogEntry(
                     ctx,
+                    pointer,
                     ref.getName(),
                     refType,
-                    Hash.of(pointer.getRefLogId()),
                     hash,
                     RefLogEntry.Operation.CREATE_REFERENCE,
                     commitTimeInMicros(),
                     Collections.emptyList());
 
-            return updateGlobalStatePointer(
-                ref, pointer, hash, newGlobalHead, newRefLogId.asBytes());
+            return updateGlobalStatePointer(ref, pointer, hash, newGlobalHead, newRefLog);
           },
           () -> createConflictMessage("Retry-Failure", ref, target));
     } catch (ReferenceAlreadyExistsException | ReferenceNotFoundException | RuntimeException e) {
@@ -407,28 +419,28 @@ public abstract class NonTransactionalDatabaseAdapter<
       throws ReferenceNotFoundException, ReferenceConflictException {
     try {
       casOpLoop(
+          "deleteRef",
           reference,
           CasOpVariant.DELETE_REF,
           (ctx, pointer, branchCommits, newKeyLists) -> {
             Hash branchHead = branchHead(pointer, reference);
             verifyExpectedHash(branchHead, reference, expectedHead);
-            Hash newGlobalHead = noopGlobalLogEntry(ctx, pointer);
+            GlobalStateLogEntry newGlobalHead = noopGlobalLogEntry(ctx, pointer);
 
             RefLogEntry.RefType refType =
                 reference instanceof TagName ? RefLogEntry.RefType.Tag : RefLogEntry.RefType.Branch;
-            Hash newRefLogId =
+            RefLogEntry newRefLog =
                 writeRefLogEntry(
                     ctx,
+                    pointer,
                     reference.getName(),
                     refType,
-                    Hash.of(pointer.getRefLogId()),
                     branchHead,
                     RefLogEntry.Operation.DELETE_REFERENCE,
                     commitTimeInMicros(),
                     Collections.emptyList());
 
-            return updateGlobalStatePointer(
-                reference, pointer, null, newGlobalHead, newRefLogId.asBytes());
+            return updateGlobalStatePointer(reference, pointer, null, newGlobalHead, newRefLog);
           },
           () -> deleteConflictMessage("Retry-Failure", reference, expectedHead));
     } catch (ReferenceNotFoundException | ReferenceConflictException | RuntimeException e) {
@@ -443,6 +455,7 @@ public abstract class NonTransactionalDatabaseAdapter<
       throws ReferenceNotFoundException, ReferenceConflictException {
     try {
       casOpLoop(
+          "assignRef",
           assignee,
           CasOpVariant.REF_UPDATE,
           (ctx, pointer, branchCommits, newKeyLists) -> {
@@ -451,23 +464,22 @@ public abstract class NonTransactionalDatabaseAdapter<
 
             validateHashExists(ctx, assignTo);
 
-            Hash newGlobalHead = noopGlobalLogEntry(ctx, pointer);
+            GlobalStateLogEntry newGlobalHead = noopGlobalLogEntry(ctx, pointer);
 
             RefLogEntry.RefType refType =
                 assignee instanceof TagName ? RefLogEntry.RefType.Tag : RefLogEntry.RefType.Branch;
-            Hash newRefLogId =
+            RefLogEntry newRefLog =
                 writeRefLogEntry(
                     ctx,
+                    pointer,
                     assignee.getName(),
                     refType,
-                    Hash.of(pointer.getRefLogId()),
                     assignTo,
                     RefLogEntry.Operation.ASSIGN_REFERENCE,
                     commitTimeInMicros(),
                     Collections.singletonList(beforeAssign));
 
-            return updateGlobalStatePointer(
-                assignee, pointer, assignTo, newGlobalHead, newRefLogId.asBytes());
+            return updateGlobalStatePointer(assignee, pointer, assignTo, newGlobalHead, newRefLog);
           },
           () -> assignConflictMessage("Retry-Failure", assignee, expectedHead, assignTo));
     } catch (ReferenceNotFoundException | ReferenceConflictException | RuntimeException e) {
@@ -487,18 +499,25 @@ public abstract class NonTransactionalDatabaseAdapter<
   public void initializeRepo(String defaultBranchName) {
     NonTransactionalOperationContext ctx = NON_TRANSACTIONAL_OPERATION_CONTEXT;
     if (fetchGlobalPointer(ctx) == null) {
-      Hash globalHead;
-      Hash newRefLogId;
+      GlobalStateLogEntry globalHead;
+      RefLogEntry newRefLog;
       try {
         long timeInMicros = commitTimeInMicros();
-        globalHead = writeGlobalCommit(ctx, timeInMicros, NO_ANCESTOR, Collections.emptyList());
+        GlobalStatePointer dummyPointer =
+            GlobalStatePointer.newBuilder()
+                .setGlobalId(NO_ANCESTOR.asBytes())
+                .addGlobalParentsInclHead(NO_ANCESTOR.asBytes())
+                .setRefLogId(NO_ANCESTOR.asBytes())
+                .addRefLogParentsInclHead(NO_ANCESTOR.asBytes())
+                .build();
+        globalHead = writeGlobalCommit(ctx, timeInMicros, dummyPointer, Collections.emptyList());
 
-        newRefLogId =
+        newRefLog =
             writeRefLogEntry(
                 ctx,
+                dummyPointer,
                 defaultBranchName,
                 RefLogEntry.RefType.Branch,
-                NO_ANCESTOR,
                 NO_ANCESTOR,
                 RefLogEntry.Operation.CREATE_REFERENCE,
                 commitTimeInMicros(),
@@ -510,7 +529,7 @@ public abstract class NonTransactionalDatabaseAdapter<
       unsafeWriteGlobalPointer(
           ctx,
           GlobalStatePointer.newBuilder()
-              .setGlobalId(globalHead.asBytes())
+              .setGlobalId(globalHead.getId())
               .addNamedReferences(
                   NamedReference.newBuilder()
                       .setName(defaultBranchName)
@@ -518,70 +537,43 @@ public abstract class NonTransactionalDatabaseAdapter<
                           RefPointer.newBuilder()
                               .setType(Type.Branch)
                               .setHash(NO_ANCESTOR.asBytes())))
-              .setRefLogId(newRefLogId.asBytes())
+              .setRefLogId(newRefLog.getRefLogId())
+              .addRefLogParentsInclHead(newRefLog.getRefLogId())
+              .addRefLogParentsInclHead(NO_ANCESTOR.asBytes())
+              .addGlobalParentsInclHead(globalHead.getId())
+              .addGlobalParentsInclHead(NO_ANCESTOR.asBytes())
               .build());
     }
   }
 
   @Override
-  public Stream<ContentIdWithType> globalKeys(ToIntFunction<ByteString> contentTypeExtractor) {
-    NonTransactionalOperationContext ctx = NON_TRANSACTIONAL_OPERATION_CONTEXT;
-
-    GlobalStatePointer pointer = fetchGlobalPointer(ctx);
-    if (pointer == null) {
-      return Stream.empty();
-    }
-
-    return globalLogFetcher(ctx, Hash.of(pointer.getGlobalId()))
+  public Stream<ContentId> globalKeys() {
+    return globalLogFetcher(NON_TRANSACTIONAL_OPERATION_CONTEXT)
         .flatMap(e -> e.getPutsList().stream())
         .map(ProtoSerialization::protoToContentIdAndBytes)
-        .map(ContentIdAndBytes::asIdWithType)
+        .map(ContentIdAndBytes::getContentId)
         .distinct();
   }
 
   @Override
-  public Optional<ContentIdAndBytes> globalContent(
-      ContentId contentId, ToIntFunction<ByteString> contentTypeExtractor) {
-    NonTransactionalOperationContext ctx = NON_TRANSACTIONAL_OPERATION_CONTEXT;
-
-    GlobalStatePointer pointer = fetchGlobalPointer(ctx);
-    if (pointer == null) {
-      return Optional.empty();
-    }
-
-    return globalLogFetcher(ctx, Hash.of(pointer.getGlobalId()))
+  public Optional<ContentIdAndBytes> globalContent(ContentId contentId) {
+    return globalLogFetcher(NON_TRANSACTIONAL_OPERATION_CONTEXT)
         .flatMap(e -> e.getPutsList().stream())
         .map(ProtoSerialization::protoToContentIdAndBytes)
         .filter(entry -> contentId.equals(entry.getContentId()))
-        .map(
-            cb ->
-                ContentIdAndBytes.of(
-                    cb.getContentId(),
-                    (byte) contentTypeExtractor.applyAsInt(cb.getValue()),
-                    cb.getValue()))
+        .map(cb -> ContentIdAndBytes.of(cb.getContentId(), cb.getValue()))
         .findFirst();
   }
 
   @Override
-  public Stream<ContentIdAndBytes> globalContent(
-      Set<ContentId> keys, ToIntFunction<ByteString> contentTypeExtractor) {
-    NonTransactionalOperationContext ctx = NON_TRANSACTIONAL_OPERATION_CONTEXT;
-
-    GlobalStatePointer pointer = fetchGlobalPointer(ctx);
-    if (pointer == null) {
-      return Stream.empty();
-    }
-
+  public Stream<ContentIdAndBytes> globalContent(Set<ContentId> keys) {
     HashSet<ContentId> remaining = new HashSet<>(keys);
 
-    Stream<GlobalStateLogEntry> stream = globalLogFetcher(ctx, Hash.of(pointer.getGlobalId()));
+    Stream<GlobalStateLogEntry> stream = globalLogFetcher(NON_TRANSACTIONAL_OPERATION_CONTEXT);
 
     return takeUntilIncludeLast(stream, x -> remaining.isEmpty())
         .flatMap(e -> e.getPutsList().stream())
-        .map(
-            c ->
-                ProtoSerialization.protoToContentIdAndBytes(
-                    c, contentTypeExtractor.applyAsInt(c.getValue())))
+        .map(ProtoSerialization::protoToContentIdAndBytes)
         .filter(kct -> remaining.remove(kct.getContentId()));
   }
 
@@ -599,6 +591,7 @@ public abstract class NonTransactionalDatabaseAdapter<
 
     try (TryLoopState tryState =
         newTryLoopState(
+            "updateRepositoryDescription",
             ts ->
                 repoDescUpdateConflictMessage(
                     String.format(
@@ -626,14 +619,39 @@ public abstract class NonTransactionalDatabaseAdapter<
     }
   }
 
+  @Override
+  public Map<String, Map<String, String>> repoMaintenance(RepoMaintenanceParams params) {
+    Map<String, Map<String, String>> result = new HashMap<>();
+    result.put("compactGlobalLog", compactGlobalLog(params.getGlobalLogCompactionParams()));
+    return result;
+  }
+
+  @Override
+  public void assertCleanStateForTests() {
+    // nothing to do
+  }
+
   // /////////////////////////////////////////////////////////////////////////////////////////////
   // Non-Transactional DatabaseAdapter subclass API (protected)
   // /////////////////////////////////////////////////////////////////////////////////////////////
 
-  protected abstract RepoDescription fetchRepositoryDescription(
+  protected final RepoDescription fetchRepositoryDescription(NonTransactionalOperationContext ctx) {
+    try (Traced ignore = trace("fetchRepositoryDescription")) {
+      return doFetchRepositoryDescription(ctx);
+    }
+  }
+
+  protected abstract RepoDescription doFetchRepositoryDescription(
       NonTransactionalOperationContext ctx);
 
-  protected abstract boolean tryUpdateRepositoryDescription(
+  protected final boolean tryUpdateRepositoryDescription(
+      NonTransactionalOperationContext ctx, RepoDescription expected, RepoDescription updateTo) {
+    try (Traced ignore = trace("tryUpdateRepositoryDescription")) {
+      return doTryUpdateRepositoryDescription(ctx, expected, updateTo);
+    }
+  }
+
+  protected abstract boolean doTryUpdateRepositoryDescription(
       NonTransactionalOperationContext ctx, RepoDescription expected, RepoDescription updateTo);
 
   /**
@@ -649,13 +667,13 @@ public abstract class NonTransactionalDatabaseAdapter<
       NamedRef target,
       GlobalStatePointer pointer,
       @Nullable Hash toHead,
-      Hash newGlobalHead,
-      ByteString newRefLogId) {
+      GlobalStateLogEntry newGlobalHead,
+      RefLogEntry newRefLog) {
 
     GlobalStatePointer.Builder newPointer =
         GlobalStatePointer.newBuilder()
-            .setGlobalId(newGlobalHead.asBytes())
-            .setRefLogId(newRefLogId);
+            .setGlobalId(newGlobalHead.getId())
+            .setRefLogId(newRefLog.getRefLogId());
     String refName = target.getName();
     if (toHead != null) {
       // Most recently updated references first
@@ -670,6 +688,11 @@ public abstract class NonTransactionalDatabaseAdapter<
     pointer.getNamedReferencesList().stream()
         .filter(namedRef -> !refName.equals(namedRef.getName()))
         .forEach(newPointer::addNamedReferences);
+    newPointer
+        .addRefLogParentsInclHead(newRefLog.getRefLogId())
+        .addAllRefLogParentsInclHead(newRefLog.getParentsList())
+        .addGlobalParentsInclHead(newGlobalHead.getId())
+        .addAllGlobalParentsInclHead(newGlobalHead.getParentsList());
     return newPointer.build();
   }
 
@@ -737,9 +760,9 @@ public abstract class NonTransactionalDatabaseAdapter<
   }
 
   /**
-   * "Body" of a Compare-And-Swap loop that returns the value to apply. {@link #casOpLoop(NamedRef,
-   * CasOpVariant, CasOp, Supplier)} then tries to perform the Compare-And-Swap using the known
-   * "current value", as passed via the {@code pointer} parameter to {@link
+   * "Body" of a Compare-And-Swap loop that returns the value to apply. {@link #casOpLoop(String,
+   * NamedRef, CasOpVariant, CasOp, Supplier)} then tries to perform the Compare-And-Swap using the
+   * known "current value", as passed via the {@code pointer} parameter to {@link
    * #apply(NonTransactionalOperationContext, GlobalStatePointer, Consumer, Consumer)}, and the "new
    * value" from the return value.
    */
@@ -755,8 +778,8 @@ public abstract class NonTransactionalDatabaseAdapter<
      *     optimistically written, those must be passed to this consumer.
      * @param newKeyLists IDs of optimistically written {@link KeyListEntity} entities must be
      *     passed to this consumer.
-     * @return "new value" that {@link #casOpLoop(NamedRef, CasOpVariant, CasOp, Supplier)} tries to
-     *     apply
+     * @return "new value" that {@link #casOpLoop(String, NamedRef, CasOpVariant, CasOp, Supplier)}
+     *     tries to apply
      */
     GlobalStatePointer apply(
         NonTransactionalOperationContext ctx,
@@ -811,12 +834,17 @@ public abstract class NonTransactionalDatabaseAdapter<
    *     when the CAS operation failed to complete within the configured time and number of retries.
    */
   protected Hash casOpLoop(
-      NamedRef ref, CasOpVariant opVariant, CasOp casOp, Supplier<String> retryErrorMessage)
+      String opName,
+      NamedRef ref,
+      CasOpVariant opVariant,
+      CasOp casOp,
+      Supplier<String> retryErrorMessage)
       throws VersionStoreException {
     NonTransactionalOperationContext ctx = NON_TRANSACTIONAL_OPERATION_CONTEXT;
 
     try (TryLoopState tryState =
         newTryLoopState(
+            opName,
             ts ->
                 repoDescUpdateConflictMessage(
                     String.format(
@@ -869,7 +897,15 @@ public abstract class NonTransactionalDatabaseAdapter<
    * without any other consistency checks/guarantees. Some implementations however can enforce
    * strict consistency checks/guarantees.
    */
-  protected abstract void writeGlobalCommit(
+  protected final void writeGlobalCommit(
+      NonTransactionalOperationContext ctx, GlobalStateLogEntry entry)
+      throws ReferenceConflictException {
+    try (Traced ignore = trace("writeGlobalCommit")) {
+      doWriteGlobalCommit(ctx, entry);
+    }
+  }
+
+  protected abstract void doWriteGlobalCommit(
       NonTransactionalOperationContext ctx, GlobalStateLogEntry entry)
       throws ReferenceConflictException;
 
@@ -878,7 +914,14 @@ public abstract class NonTransactionalDatabaseAdapter<
    * other consistency checks/guarantees. Some implementations however can enforce strict
    * consistency checks/guarantees.
    */
-  protected abstract void writeRefLog(NonTransactionalOperationContext ctx, RefLogEntry entry)
+  protected final void writeRefLog(NonTransactionalOperationContext ctx, RefLogEntry entry)
+      throws ReferenceConflictException {
+    try (Traced ignore = trace("writeRefLog")) {
+      doWriteRefLog(ctx, entry);
+    }
+  }
+
+  protected abstract void doWriteRefLog(NonTransactionalOperationContext ctx, RefLogEntry entry)
       throws ReferenceConflictException;
 
   /**
@@ -887,39 +930,75 @@ public abstract class NonTransactionalDatabaseAdapter<
   protected abstract void unsafeWriteGlobalPointer(
       NonTransactionalOperationContext ctx, GlobalStatePointer pointer);
 
-  protected Hash writeGlobalCommit(
+  protected GlobalStateLogEntry writeGlobalCommit(
       NonTransactionalOperationContext ctx,
       long timeInMicros,
-      Hash parentHash,
+      GlobalStatePointer pointer,
       List<ContentIdAndBytes> globals)
       throws ReferenceConflictException {
-    GlobalStateLogEntry currentEntry = fetchFromGlobalLog(ctx, parentHash);
 
-    Stream<Hash> newParents = Stream.of(parentHash);
-    if (currentEntry != null) {
+    Hash parentHash = Hash.of(pointer.getGlobalId());
+
+    // Before Nessie 0.21.0: the global-state-pointer contains the "heads" for the ref-log and
+    // global-log, so it has to read the head ref-log & global-log to get the IDs of all the
+    // previous parents to fill the parents in the new global-log-entry & ref-log-entry.
+    //
+    // Since Nessie 0.21.0: the global-state-pointer contains the "heads" for the ref-log and
+    // global-log PLUS the parents of those, so Nessie no longer need to read the head entries
+    // from the ref-log + global-log.
+    //
+    // The check of the first entry is there to ensure backwards compatibility and also
+    // rolling-upgrades work.
+    Stream<ByteString> newParents;
+    if (pointer.getGlobalParentsInclHeadCount() == 0
+        || !pointer.getGlobalId().equals(pointer.getGlobalParentsInclHead(0))) {
+      // Before Nessie 0.21.0
+
+      newParents = Stream.of(parentHash.asBytes());
+      GlobalStateLogEntry currentEntry = fetchFromGlobalLog(ctx, parentHash);
+      if (currentEntry != null) {
+        newParents =
+            Stream.concat(
+                newParents,
+                currentEntry.getParentsList().stream()
+                    .limit(config.getParentsPerGlobalCommit() - 1));
+      }
+    } else {
+      // Since Nessie 0.21.0
+
       newParents =
-          Stream.concat(
-              newParents,
-              currentEntry.getParentsList().stream()
-                  .limit(config.getParentsPerGlobalCommit() - 1)
-                  .map(Hash::of));
+          pointer.getGlobalParentsInclHeadList().stream().limit(config.getParentsPerGlobalCommit());
     }
 
-    Hash hash = randomHash();
-    GlobalStateLogEntry.Builder entry =
-        GlobalStateLogEntry.newBuilder().setCreatedTime(timeInMicros).setId(hash.asBytes());
-    newParents.forEach(p -> entry.addParents(p.asBytes()));
+    GlobalStateLogEntry.Builder entry = newGlobalLogEntryBuilder(timeInMicros);
+    newParents.forEach(entry::addParents);
     globals.forEach(g -> entry.addPuts(ProtoSerialization.toProto(g)));
-    writeGlobalCommit(ctx, entry.build());
+    GlobalStateLogEntry globalLogEntry = entry.build();
+    writeGlobalCommit(ctx, globalLogEntry);
 
-    return hash;
+    return globalLogEntry;
+  }
+
+  protected GlobalStateLogEntry.Builder newGlobalLogEntryBuilder(long timeInMicros) {
+    return GlobalStateLogEntry.newBuilder()
+        .setCreatedTime(timeInMicros)
+        .setId(randomHash().asBytes());
   }
 
   /**
    * Atomically update the global-commit-pointer to the given new-global-head, if the value in the
    * database is the given expected-global-head.
    */
-  protected abstract boolean globalPointerCas(
+  protected final boolean globalPointerCas(
+      NonTransactionalOperationContext ctx,
+      GlobalStatePointer expected,
+      GlobalStatePointer newPointer) {
+    try (Traced ignore = trace("globalPointerCas")) {
+      return doGlobalPointerCas(ctx, expected, newPointer);
+    }
+  }
+
+  protected abstract boolean doGlobalPointerCas(
       NonTransactionalOperationContext ctx,
       GlobalStatePointer expected,
       GlobalStatePointer newPointer);
@@ -933,12 +1012,36 @@ public abstract class NonTransactionalDatabaseAdapter<
    * <p>Implementation notes: non-transactional implementations <em>must</em> delete entries for the
    * given keys, no-op for transactional implementations.
    */
-  protected abstract void cleanUpCommitCas(
+  protected final void cleanUpCommitCas(
+      NonTransactionalOperationContext ctx,
+      Hash globalId,
+      Set<Hash> branchCommits,
+      Set<Hash> newKeyLists,
+      Hash refLogId) {
+    try (Traced ignore =
+        trace("cleanUpCommitCas")
+            .tag(TAG_COMMIT_COUNT, branchCommits.size())
+            .tag(TAG_KEY_LIST_COUNT, newKeyLists.size())) {
+      doCleanUpCommitCas(ctx, globalId, branchCommits, newKeyLists, refLogId);
+    }
+  }
+
+  protected abstract void doCleanUpCommitCas(
       NonTransactionalOperationContext ctx,
       Hash globalId,
       Set<Hash> branchCommits,
       Set<Hash> newKeyLists,
       Hash refLogId);
+
+  protected final void cleanUpGlobalLog(
+      NonTransactionalOperationContext ctx, Collection<Hash> globalIds) {
+    try (Traced ignore = trace("cleanUpGlobalLog").tag(TAG_COMMIT_COUNT, globalIds.size())) {
+      doCleanUpGlobalLog(ctx, globalIds);
+    }
+  }
+
+  protected abstract void doCleanUpGlobalLog(
+      NonTransactionalOperationContext ctx, Collection<Hash> globalIds);
 
   /**
    * Writes a global-state-log-entry without any operations, just to move the global-pointer
@@ -946,12 +1049,11 @@ public abstract class NonTransactionalDatabaseAdapter<
    */
   // TODO maybe replace with a 2nd-ary value in global-state-pointer to prevent the empty
   //  global-log-entry
-  protected Hash noopGlobalLogEntry(
+  protected GlobalStateLogEntry noopGlobalLogEntry(
       NonTransactionalOperationContext ctx, GlobalStatePointer pointer)
       throws ReferenceConflictException {
     // Need a new empty global-log entry to be able to CAS
-    return writeGlobalCommit(
-        ctx, commitTimeInMicros(), Hash.of(pointer.getGlobalId()), Collections.emptyList());
+    return writeGlobalCommit(ctx, commitTimeInMicros(), pointer, Collections.emptyList());
   }
 
   /**
@@ -964,6 +1066,9 @@ public abstract class NonTransactionalDatabaseAdapter<
    */
   protected static Hash branchHead(GlobalStatePointer pointer, NamedRef ref)
       throws ReferenceNotFoundException {
+    if (ref == null) {
+      return null;
+    }
     if (pointer == null) {
       throw referenceNotFound(ref);
     }
@@ -1005,23 +1110,24 @@ public abstract class NonTransactionalDatabaseAdapter<
    *
    * @return the current global points if set, or {@code null} if not set.
    */
-  protected abstract GlobalStatePointer fetchGlobalPointer(NonTransactionalOperationContext ctx);
+  protected final GlobalStatePointer fetchGlobalPointer(NonTransactionalOperationContext ctx) {
+    try (Traced ignore = trace("fetchGlobalPointer")) {
+      return doFetchGlobalPointer(ctx);
+    }
+  }
+
+  protected abstract GlobalStatePointer doFetchGlobalPointer(NonTransactionalOperationContext ctx);
 
   @Override
-  protected Map<ContentId, ByteString> fetchGlobalStates(
+  protected Map<ContentId, ByteString> doFetchGlobalStates(
       NonTransactionalOperationContext ctx, Set<ContentId> contentIds) {
     if (contentIds.isEmpty()) {
       return Collections.emptyMap();
     }
 
-    Set<ContentId> remainingIds = new HashSet<>(contentIds);
-    GlobalStatePointer pointer = fetchGlobalPointer(ctx);
-    if (pointer == null) {
-      return Collections.emptyMap();
-    }
-    Hash globalHead = Hash.of(pointer.getGlobalId());
+    Stream<GlobalStateLogEntry> log = globalLogFetcher(ctx);
 
-    Stream<GlobalStateLogEntry> log = globalLogFetcher(ctx, globalHead);
+    Set<ContentId> remainingIds = new HashSet<>(contentIds);
 
     return takeUntilExcludeLast(log, x -> remainingIds.isEmpty())
         .flatMap(e -> e.getPutsList().stream())
@@ -1032,20 +1138,60 @@ public abstract class NonTransactionalDatabaseAdapter<
   }
 
   /** Reads from the global-state-log starting at the given global-state-log-ID. */
+  private Stream<GlobalStateLogEntry> globalLogFetcher(NonTransactionalOperationContext ctx) {
+    return globalLogFetcher(ctx, fetchGlobalPointer(ctx));
+  }
+
   private Stream<GlobalStateLogEntry> globalLogFetcher(
-      NonTransactionalOperationContext ctx, Hash initialId) {
-    GlobalStateLogEntry initial = fetchFromGlobalLog(ctx, initialId);
-    if (initial == null) {
-      throw new RuntimeException(
-          new ReferenceNotFoundException(
-              String.format("Global log entry '%s' not does not exist.", initialId.asString())));
+      NonTransactionalOperationContext ctx, GlobalStatePointer pointer) {
+    if (pointer == null) {
+      return Stream.empty();
     }
-    Spliterator<GlobalStateLogEntry> split =
-        logFetcher(
-            ctx,
-            initial,
-            this::fetchPageFromGlobalLog,
-            e -> e.getParentsList().stream().map(Hash::of).collect(Collectors.toList()));
+
+    // Before Nessie 0.21.0: the global-state-pointer contains the "heads" for the ref-log and
+    // global-log, so it has to read the head ref-log & global-log to get the IDs of all the
+    // previous parents to fill the parents in the new global-log-entry & ref-log-entry.
+    //
+    // Since Nessie 0.21.0: the global-state-pointer contains the "heads" for the ref-log and
+    // global-log PLUS the parents of those, so Nessie no longer need to read the head entries
+    // from the ref-log + global-log.
+    //
+    // The check of the first entry is there to ensure backwards compatibility and also
+    // rolling-upgrades work.
+    Spliterator<GlobalStateLogEntry> split;
+    if (pointer.getGlobalParentsInclHeadCount() == 0
+        || !pointer.getGlobalId().equals(pointer.getGlobalParentsInclHead(0))) {
+      // Before Nessie 0.21.0
+
+      Hash initialId = Hash.of(pointer.getGlobalId());
+
+      GlobalStateLogEntry initial = fetchFromGlobalLog(ctx, initialId);
+      if (initial == null) {
+        throw new RuntimeException(
+            new ReferenceNotFoundException(
+                String.format("Global log entry '%s' not does not exist.", initialId.asString())));
+      }
+
+      split =
+          logFetcher(
+              ctx,
+              initial,
+              this::fetchPageFromGlobalLog,
+              e -> e.getParentsList().stream().map(Hash::of).collect(Collectors.toList()));
+    } else {
+      // Since Nessie 0.21.0
+
+      List<Hash> hashes =
+          pointer.getGlobalParentsInclHeadList().stream()
+              .map(Hash::of)
+              .collect(Collectors.toList());
+      split =
+          logFetcherWithPage(
+              ctx,
+              hashes,
+              this::fetchPageFromGlobalLog,
+              e -> e.getParentsList().stream().map(Hash::of).collect(Collectors.toList()));
+    }
     return StreamSupport.stream(split, false);
   }
 
@@ -1054,59 +1200,63 @@ public abstract class NonTransactionalDatabaseAdapter<
    *
    * @return the loaded entry if it is available, {@code null} if it does not exist.
    */
-  protected abstract GlobalStateLogEntry fetchFromGlobalLog(
+  protected final GlobalStateLogEntry fetchFromGlobalLog(
+      NonTransactionalOperationContext ctx, Hash id) {
+    try (Traced ignore = trace("fetchFromGlobalLog").tag(TAG_HASH, id.asString())) {
+      return doFetchFromGlobalLog(ctx, id);
+    }
+  }
+
+  protected abstract GlobalStateLogEntry doFetchFromGlobalLog(
       NonTransactionalOperationContext ctx, Hash id);
 
-  protected abstract List<GlobalStateLogEntry> fetchPageFromGlobalLog(
+  protected final List<GlobalStateLogEntry> fetchPageFromGlobalLog(
+      NonTransactionalOperationContext ctx, List<Hash> hashes) {
+    try (Traced ignore =
+        trace("fetchPageFromGlobalLog")
+            .tag(TAG_HASH, hashes.get(0).asString())
+            .tag(TAG_COUNT, hashes.size())) {
+      return doFetchPageFromGlobalLog(ctx, hashes);
+    }
+  }
+
+  protected abstract List<GlobalStateLogEntry> doFetchPageFromGlobalLog(
       NonTransactionalOperationContext ctx, List<Hash> hashes);
 
-  protected Hash writeRefLogEntry(
+  protected RefLogEntry writeRefLogEntry(
       NonTransactionalOperationContext ctx,
+      GlobalStatePointer pointer,
       String refName,
-      RefLogEntry.RefType refType,
-      Hash parentRefLogId,
+      RefType refType,
       Hash commitHash,
-      RefLogEntry.Operation operation,
+      Operation operation,
       long timeInMicros,
       List<Hash> sourceHashes)
       throws ReferenceConflictException {
 
+    Hash parentHash = Hash.of(pointer.getRefLogId());
     Hash currentRefLogId = randomHash();
-    RefLog parentEntry = fetchFromRefLog(ctx, parentRefLogId);
-    RefLogEntry refLogEntry =
-        buildRefLogEntry(
-            refName,
-            refType,
-            parentRefLogId,
-            commitHash,
-            operation,
-            timeInMicros,
-            sourceHashes,
-            currentRefLogId,
-            parentEntry);
 
-    writeRefLog(ctx, refLogEntry);
+    Stream<ByteString> newParents;
+    if (pointer.getRefLogParentsInclHeadCount() == 0
+        || !pointer.getRefLogId().equals(pointer.getRefLogParentsInclHead(0))) {
+      // Before Nessie 0.21.0
 
-    return currentRefLogId;
-  }
+      newParents = Stream.of(parentHash.asBytes());
+      RefLog currentEntry = fetchFromRefLog(ctx, parentHash);
+      if (currentEntry != null) {
+        newParents =
+            Stream.concat(
+                newParents,
+                currentEntry.getParents().stream()
+                    .limit(config.getParentsPerRefLogEntry() - 1)
+                    .map(Hash::asBytes));
+      }
+    } else {
+      // Since Nessie 0.21.0
 
-  private RefLogEntry buildRefLogEntry(
-      String refName,
-      RefLogEntry.RefType refType,
-      Hash parentRefLogId,
-      Hash commitHash,
-      RefLogEntry.Operation operation,
-      long timeInMicros,
-      List<Hash> sourceHashes,
-      Hash currentRefLogId,
-      RefLog parentEntry) {
-    Stream<Hash> newParents = Stream.of(parentRefLogId);
-
-    if (parentEntry != null) {
       newParents =
-          Stream.concat(
-              newParents,
-              parentEntry.getParents().stream().limit(config.getParentsPerRefLogEntry() - 1));
+          pointer.getRefLogParentsInclHeadList().stream().limit(config.getParentsPerRefLogEntry());
     }
 
     RefLogEntry.Builder entry =
@@ -1118,8 +1268,236 @@ public abstract class NonTransactionalDatabaseAdapter<
             .setOperationTime(timeInMicros)
             .setOperation(operation);
     sourceHashes.forEach(hash -> entry.addSourceHashes(hash.asBytes()));
-    newParents.forEach(p -> entry.addParents(p.asBytes()));
-    return entry.build();
+    newParents.forEach(entry::addParents);
+    RefLogEntry refLogEntry = entry.build();
+
+    writeRefLog(ctx, refLogEntry);
+
+    return refLogEntry;
+  }
+
+  private static final RuntimeException COMPACTION_NOT_NECESSARY_LENGTH = new RuntimeException();
+  private static final RuntimeException COMPACTION_NOT_NECESSARY_WITHIN = new RuntimeException();
+
+  protected Map<String, String> compactGlobalLog(
+      GlobalLogCompactionParams globalLogCompactionParams) {
+    if (!globalLogCompactionParams.isEnabled()) {
+      return ImmutableMap.of("compacted", "false", "reason", "not enabled");
+    }
+
+    // Not using casOpLoop() here, as it is simpler than adopting casOpLoop().
+    try (TryLoopState tryState =
+        newTryLoopState(
+            "compact-global-log",
+            ts ->
+                repoDescUpdateConflictMessage(
+                    String.format(
+                        "%s after %d retries, %d ms",
+                        "Retry-Failure", ts.getRetries(), ts.getDuration(TimeUnit.MILLISECONDS))),
+            this::tryLoopStateCompletion,
+            config)) {
+
+      CompactionStats stats = new CompactionStats();
+      while (true) {
+        NonTransactionalOperationContext ctx = NON_TRANSACTIONAL_OPERATION_CONTEXT;
+
+        GlobalStatePointer pointer = fetchGlobalPointer(ctx);
+
+        // Collect the old global-log-ids, to delete those after compaction
+        List<Hash> oldLogIds = new ArrayList<>();
+        // Map with all global contents.
+        Map<String, ByteString> globalContents = new HashMap<>();
+        // Content-IDs, most recently updated contents first.
+        List<String> contentIdsByRecency = new ArrayList<>();
+
+        // Read the global log - from the most recent global-log entry to the oldest.
+        try (Stream<GlobalStateLogEntry> globalLog = globalLogFetcher(ctx, pointer)) {
+          globalLog.forEach(
+              e -> {
+                if (stats.read < globalLogCompactionParams.getNoCompactionWhenCompactedWithin()
+                    && stats.puts > stats.read) {
+                  // First page in the global-log contains at least one compacted entry, so
+                  // do not compact.
+                  throw COMPACTION_NOT_NECESSARY_WITHIN;
+                }
+                stats.read++;
+                oldLogIds.add(Hash.of(e.getId()));
+                for (ContentIdWithBytes put : e.getPutsList()) {
+                  stats.puts++;
+                  String cid = put.getContentId().getId();
+                  if (globalContents.putIfAbsent(cid, put.getValue()) == null) {
+                    stats.uniquePuts++;
+                    contentIdsByRecency.add(cid);
+                  }
+                }
+              });
+
+          if (stats.read < globalLogCompactionParams.getNoCompactionUpToLength()) {
+            // Global log does not have more global-log entries than can be fetched with a
+            // single-bulk read, so do not compact at all.
+            throw COMPACTION_NOT_NECESSARY_LENGTH;
+          }
+        } catch (RuntimeException e) {
+          if (e == COMPACTION_NOT_NECESSARY_WITHIN) {
+            tryState.success(null);
+            return ImmutableMap.of(
+                "compacted",
+                "false",
+                "reason",
+                String.format(
+                    "compacted entry within %d most recent log entries",
+                    globalLogCompactionParams.getNoCompactionWhenCompactedWithin()));
+          }
+          if (e == COMPACTION_NOT_NECESSARY_LENGTH) {
+            tryState.success(null);
+            return ImmutableMap.of(
+                "compacted",
+                "false",
+                "reason",
+                String.format(
+                    "less than %d entries", globalLogCompactionParams.getNoCompactionUpToLength()));
+          }
+          throw e;
+        }
+
+        // Collect the IDs of the written global-log-entries, to delete those when the CAS
+        // operation failed
+        List<ByteString> newLogIds = new ArrayList<>();
+
+        // Reverse the order of content-IDs, most recently updated contents LAST.
+        // Do this to have the active contents closer to the HEAD of the global log.
+        Collections.reverse(contentIdsByRecency);
+
+        // Maintain the list of global-log-entry parent IDs, but in reverse order as in
+        // GlobalLogEntry for easier management here.
+        List<ByteString> globalParentsReverse = new ArrayList<>(config.getParentsPerGlobalCommit());
+        globalParentsReverse.add(NO_ANCESTOR.asBytes());
+
+        GlobalStateLogEntry.Builder currentEntry =
+            newGlobalLogEntryBuilder(commitTimeInMicros()).addParents(globalParentsReverse.get(0));
+
+        for (String cid : contentIdsByRecency) {
+          if (currentEntry.buildPartial().getSerializedSize() >= config.getGlobalLogEntrySize()) {
+            compactGlobalLogWriteEntry(ctx, stats, globalParentsReverse, currentEntry, newLogIds);
+
+            // Prepare new entry
+            currentEntry = newGlobalLogEntryBuilder(commitTimeInMicros());
+            for (int i = globalParentsReverse.size() - 1; i >= 0; i--) {
+              currentEntry.addParents(globalParentsReverse.get(i));
+            }
+          }
+
+          ByteString value = globalContents.get(cid);
+          currentEntry.addPuts(
+              ContentIdWithBytes.newBuilder()
+                  .setContentId(AdapterTypes.ContentId.newBuilder().setId(cid))
+                  .setTypeUnused(0)
+                  .setValue(value)
+                  .build());
+        }
+
+        compactGlobalLogWriteEntry(ctx, stats, globalParentsReverse, currentEntry, newLogIds);
+
+        GlobalStatePointer newPointer =
+            GlobalStatePointer.newBuilder()
+                .addAllNamedReferences(pointer.getNamedReferencesList())
+                .addAllRefLogParentsInclHead(pointer.getRefLogParentsInclHeadList())
+                .setRefLogId(pointer.getRefLogId())
+                .setGlobalId(currentEntry.getId())
+                .addGlobalParentsInclHead(currentEntry.getId())
+                .addAllGlobalParentsInclHead(currentEntry.getParentsList())
+                .build();
+
+        stats.addToTotal();
+
+        // CAS global pointer
+        if (globalPointerCas(ctx, pointer, newPointer)) {
+          tryState.success(null);
+          cleanUpGlobalLog(ctx, oldLogIds);
+          return stats.asMap(tryState);
+        }
+
+        // Note: if it turns out that there are too many CAS retries happening, the overall
+        // mechanism can be updated as follows. Since the approach below is much more complex
+        // and harder to test, if's not part of the initial implementation.
+        //
+        // 1. Read the whole global-log as currently, but outside the actual CAS-loop.
+        //    Save the current HEAD of the global-log
+        // 2. CAS-loop:
+        // 2.1. Construct and write the new global-log
+        // 2.2. Try the CAS, if it succeeds, fine
+        // 2.3. If the CAS failed:
+        // 2.3.1. Clean up the optimistically written new global-log
+        // 2.3.2. Read the global-log from its new HEAD up to the current HEAD from step 1.
+        //        Only add the most-recent values for the content-IDs in the incrementally
+        //        read global-log
+        // 2.3.3. Remember the "new HEAD" as the "current HEAD"
+        // 2.3.4. Continue to step 2.1.
+
+        cleanUpGlobalLog(ctx, newLogIds.stream().map(Hash::of).collect(Collectors.toList()));
+        stats.onRetry();
+        tryState.retry();
+      }
+    } catch (ReferenceConflictException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  private void compactGlobalLogWriteEntry(
+      NonTransactionalOperationContext ctx,
+      CompactionStats stats,
+      List<ByteString> globalParentsReverse,
+      Builder currentEntry,
+      List<ByteString> newLogIds)
+      throws ReferenceConflictException {
+    writeGlobalCommit(ctx, currentEntry.build());
+    newLogIds.add(currentEntry.getId());
+    stats.written++;
+
+    if (globalParentsReverse.size() == config.getParentsPerGlobalCommit()) {
+      globalParentsReverse.remove(0);
+    }
+    globalParentsReverse.add(currentEntry.getId());
+  }
+
+  private static final class CompactionStats {
+    long written;
+    long read;
+    long puts;
+    long uniquePuts;
+    long totalWritten;
+    long totalRead;
+
+    Map<String, String> asMap(TryLoopState tryState) {
+      return ImmutableMap.of(
+          "compacted",
+          "true",
+          "entries.written",
+          Long.toString(written),
+          "entries.read",
+          Long.toString(read),
+          "entries.puts",
+          Long.toString(puts),
+          "entries.uniquePuts",
+          Long.toString(uniquePuts),
+          "entries.written.total",
+          Long.toString(totalWritten),
+          "entries.read.total",
+          Long.toString(totalRead),
+          "duration.millis",
+          Long.toString(tryState.getDuration(TimeUnit.MILLISECONDS)),
+          "cas-retries",
+          Long.toString(tryState.getRetries()));
+    }
+
+    public void addToTotal() {
+      totalRead += read;
+      totalWritten += written;
+    }
+
+    void onRetry() {
+      read = written = puts = uniquePuts = 0;
+    }
   }
 
   @Override

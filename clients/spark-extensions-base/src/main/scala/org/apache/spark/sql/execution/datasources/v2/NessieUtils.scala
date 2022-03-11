@@ -164,17 +164,30 @@ object NessieUtils {
       catalog: Option[String]
   ): NessieApiV1 = {
     val catalogName = catalog.getOrElse(currentCatalog.name)
-    val catalogConf = SparkSession.active.sparkContext.conf
+    val sparkConf = SparkSession.active.sparkContext.conf
+    val catalogConf = sparkConf
       .getAllWithPrefix(s"spark.sql.catalog.$catalogName.")
       .toMap
-    // Referring to https://github.com/apache/iceberg/blob/master/nessie/src/main/java/org/apache/iceberg/nessie/NessieCatalog.java
-    // Not using fully-qualified class name to provide protection from shading activities (if any)
-    require(
-      catalogConf
-        .get("catalog-impl")
-        .exists(impl => impl.endsWith(".NessieCatalog")),
-      "The command works only when the catalog is a NessieCatalog. Either set the catalog via USE <catalog_name> or provide the catalog during execution: <command> IN <catalog_name>."
-    )
+
+    val catalogClass = sparkConf.getOption(s"spark.sql.catalog.$catalogName")
+    val needsImplCheck =
+      catalogClass.map(!_.endsWith(".DeltaCatalog")).getOrElse(true)
+    if (needsImplCheck) {
+      val catalogImpl = catalogConf.get("catalog-impl")
+      val catalogErrorDetail = catalogImpl match {
+        case Some(clazz) => s"but $catalogName is a $clazz"
+        case None =>
+          s"but spark.sql.catalog.$catalogName.catalog-impl is not set"
+      }
+      // Referring to https://github.com/apache/iceberg/blob/master/nessie/src/main/java/org/apache/iceberg/nessie/NessieCatalog.java
+      // Not using fully-qualified class name to provide protection from shading activities (if any)
+      require(
+        catalogImpl
+          .exists(impl => impl.endsWith(".NessieCatalog")),
+        s"The command works only when the catalog is a NessieCatalog ($catalogErrorDetail). Either set the catalog via USE <catalog_name> or provide the catalog during execution: <command> IN <catalog_name>."
+      )
+    }
+
     HttpClientBuilder
       .builder()
       .fromConfig(x => catalogConf.getOrElse(x.replace("nessie.", ""), null))
@@ -191,6 +204,8 @@ object NessieUtils {
       SparkSession.active.sessionState.catalogManager.catalog(catalogName)
     SparkSession.active.sparkContext.conf
       .set(s"spark.sql.catalog.$catalogName.ref", ref.getName)
+    SparkSession.active.sparkContext.conf
+      .set(s"spark.sql.catalog.$catalogName.ref.hash", ref.getHash)
     val catalogConf = SparkSession.active.sparkContext.conf
       .getAllWithPrefix(s"spark.sql.catalog.$catalogName.")
       .toMap

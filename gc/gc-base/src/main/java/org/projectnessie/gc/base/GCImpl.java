@@ -16,12 +16,12 @@
 package org.projectnessie.gc.base;
 
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalInt;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.spark.sql.SparkSession;
 import org.projectnessie.api.params.FetchOption;
@@ -33,12 +33,15 @@ import org.projectnessie.model.RefLogResponse;
 import org.projectnessie.model.Reference;
 import org.projectnessie.model.ReferenceMetadata;
 import org.projectnessie.model.Tag;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Encapsulates the logic to retrieve expired contents by walking over all commits in all
  * named-references.
  */
 public class GCImpl {
+  private static final Logger LOGGER = LoggerFactory.getLogger(GCImpl.class);
   private final GCParams gcParams;
 
   /**
@@ -48,6 +51,7 @@ public class GCImpl {
    */
   public GCImpl(GCParams gcParams) {
     this.gcParams = gcParams;
+    LOGGER.info("GCImpl with params: {}", gcParams);
   }
 
   /**
@@ -96,8 +100,12 @@ public class GCImpl {
       DistributedIdentifyContents distributedIdentifyContents =
           new DistributedIdentifyContents(session, gcParams);
       List<Reference> liveReferences = api.getAllReferences().get().getReferences();
-      Map<Reference, Instant> droppedReferenceTimeMap = collectDeadReferences(api);
-      List<Reference> allRefs = new ArrayList<>(liveReferences);
+      Map<String, Instant> droppedReferenceTimeMap = collectDeadReferences(api);
+      // As this list of references is passed from Spark driver to executor,
+      // using available Immutables JSON serialization instead of adding java serialization to the
+      // classes.
+      List<String> allRefs =
+          liveReferences.stream().map(GCUtil::serializeReference).collect(Collectors.toList());
       if (droppedReferenceTimeMap.size() > 0) {
         allRefs.addAll(droppedReferenceTimeMap.keySet());
       }
@@ -130,19 +138,19 @@ public class GCImpl {
     return defaultRefMetadata.getNumTotalCommits();
   }
 
-  private static Map<Reference, Instant> collectDeadReferences(NessieApiV1 api) {
-    Map<Reference, Instant> droppedReferenceTimeMap = new HashMap<>();
+  private static Map<String, Instant> collectDeadReferences(NessieApiV1 api) {
+    Map<String, Instant> droppedReferenceTimeMap = new HashMap<>();
     Stream<RefLogResponse.RefLogResponseEntry> reflogStream;
     try {
       reflogStream =
           StreamingUtil.getReflogStream(
               api,
-              null,
-              null,
-              String.format(
-                  "reflog.operation == '%s' || reflog.operation == " + "'%s'",
-                  RefLogResponse.RefLogResponseEntry.DELETE_REFERENCE,
-                  RefLogResponse.RefLogResponseEntry.ASSIGN_REFERENCE),
+              builder ->
+                  builder.filter(
+                      String.format(
+                          "reflog.operation == '%s' || reflog.operation == " + "'%s'",
+                          RefLogResponse.RefLogResponseEntry.DELETE_REFERENCE,
+                          RefLogResponse.RefLogResponseEntry.ASSIGN_REFERENCE)),
               OptionalInt.empty());
     } catch (NessieNotFoundException e) {
       throw new RuntimeException(e);
@@ -164,12 +172,13 @@ public class GCImpl {
           switch (entry.getRefType()) {
             case RefLogResponse.RefLogResponseEntry.BRANCH:
               droppedReferenceTimeMap.put(
-                  Branch.of(entry.getRefName(), hash),
+                  GCUtil.serializeReference(Branch.of(entry.getRefName(), hash)),
                   getInstantFromMicros(entry.getOperationTime()));
               break;
             case RefLogResponse.RefLogResponseEntry.TAG:
               droppedReferenceTimeMap.put(
-                  Tag.of(entry.getRefName(), hash), getInstantFromMicros(entry.getOperationTime()));
+                  GCUtil.serializeReference(Tag.of(entry.getRefName(), hash)),
+                  getInstantFromMicros(entry.getOperationTime()));
               break;
             default:
               throw new RuntimeException(

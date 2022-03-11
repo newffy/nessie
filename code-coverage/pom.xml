@@ -22,7 +22,7 @@
   <parent>
     <groupId>org.projectnessie</groupId>
     <artifactId>nessie</artifactId>
-    <version>0.20.2-SNAPSHOT</version>
+    <version>0.21.3-SNAPSHOT</version>
   </parent>
 
   <artifactId>nessie-code-coverage</artifactId>
@@ -32,11 +32,6 @@
   <description>Aggregates all code-projects for Nessie for a consolidated code-coverage report.</description>
 
   <dependencies>
-    <dependency>
-      <groupId>org.projectnessie</groupId>
-      <artifactId>nessie-apprunner-common</artifactId>
-      <version>${project.version}</version>
-    </dependency>
     <dependency>
       <groupId>org.projectnessie</groupId>
       <artifactId>nessie-client</artifactId>
@@ -65,6 +60,11 @@
     <dependency>
       <groupId>org.projectnessie</groupId>
       <artifactId>nessie-quarkus</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.projectnessie</groupId>
+      <artifactId>nessie-quarkus-common</artifactId>
       <version>${project.version}</version>
     </dependency>
     <dependency>
@@ -170,6 +170,21 @@
     <dependency>
       <groupId>org.projectnessie</groupId>
       <artifactId>nessie-gc-base</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.projectnessie</groupId>
+      <artifactId>nessie-compatibility-common</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.projectnessie</groupId>
+      <artifactId>nessie-compatibility-jersey</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.projectnessie</groupId>
+      <artifactId>nessie-compatibility-tests</artifactId>
       <version>${project.version}</version>
     </dependency>
   </dependencies>

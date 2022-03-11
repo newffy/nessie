@@ -99,7 +99,8 @@ class TestTracingVersionStore {
                                 BranchName.of("mock-branch"),
                                 Optional.empty(),
                                 "metadata",
-                                Collections.emptyList()),
+                                Collections.emptyList(),
+                                () -> {}),
                         () -> Hash.of("deadbeefcafebabe")),
                 new TestedTraceingStoreInvocation<VersionStore<String, String, DummyEnum>>(
                         "Transplant", refNotFoundAndRefConflictThrows)
@@ -154,7 +155,7 @@ class TestTracingVersionStore {
                             vs.delete(
                                 BranchName.of("mock-branch"), Optional.of(Hash.of("cafebabe")))),
                 new TestedTraceingStoreInvocation<VersionStore<String, String, DummyEnum>>(
-                        "GetCommits", refNotFoundThrows)
+                        "GetCommits.stream", refNotFoundThrows)
                     .tag("nessie.version-store.ref", "BranchName{name=mock-branch}")
                     .function(
                         vs -> vs.getCommits(BranchName.of("mock-branch"), false),
@@ -169,13 +170,13 @@ class TestTracingVersionStore {
                                     .commitMeta("log#2")
                                     .build())),
                 new TestedTraceingStoreInvocation<VersionStore<String, String, DummyEnum>>(
-                        "GetKeys", refNotFoundThrows)
+                        "GetKeys.stream", refNotFoundThrows)
                     .tag("nessie.version-store.ref", "Hash cafe4242")
                     .function(
                         vs -> vs.getKeys(Hash.of("cafe4242")),
                         () -> Stream.of(Key.of("hello", "world"))),
                 new TestedTraceingStoreInvocation<VersionStore<String, String, DummyEnum>>(
-                        "GetNamedRefs", runtimeThrows)
+                        "GetNamedRefs.stream", runtimeThrows)
                     .function(
                         stringStringDummyEnumVersionStore ->
                             stringStringDummyEnumVersionStore.getNamedRefs(
@@ -202,7 +203,7 @@ class TestTracingVersionStore {
                                 Collections.singletonList(Key.of("some", "key"))),
                         Collections::emptyMap),
                 new TestedTraceingStoreInvocation<VersionStore<String, String, DummyEnum>>(
-                        "GetDiffs", refNotFoundThrows)
+                        "GetDiffs.stream", refNotFoundThrows)
                     .tag("nessie.version-store.from", "BranchName{name=mock-branch}")
                     .tag("nessie.version-store.to", "BranchName{name=foo-branch}")
                     .function(

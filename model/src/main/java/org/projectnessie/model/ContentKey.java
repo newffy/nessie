@@ -20,7 +20,6 @@ import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
 import com.fasterxml.jackson.databind.annotation.JsonSerialize;
-import java.io.Serializable;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
@@ -36,10 +35,10 @@ import org.projectnessie.model.ImmutableContentKey.Builder;
  * <p>For URL encoding, embedded periods within a segment are replaced with zero byte values before
  * passing in a url string.
  */
-@Value.Immutable(lazyhash = true)
+@Value.Immutable
 @JsonSerialize(as = ImmutableContentKey.class)
 @JsonDeserialize(as = ImmutableContentKey.class)
-public abstract class ContentKey implements Serializable {
+public abstract class ContentKey {
 
   private static final char ZERO_BYTE = '\u0000';
   private static final String ZERO_BYTE_STRING = Character.toString(ZERO_BYTE);

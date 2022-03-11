@@ -22,7 +22,7 @@
   <parent>
     <groupId>org.projectnessie</groupId>
     <artifactId>nessie</artifactId>
-    <version>0.20.2-SNAPSHOT</version>
+    <version>0.21.3-SNAPSHOT</version>
   </parent>
 
   <artifactId>nessie-tools</artifactId>
@@ -31,8 +31,6 @@
   <name>Nessie - Tools</name>
 
   <modules>
-    <module>apprunner-common</module>
-    <module>apprunner-maven-plugin</module>
     <module>content-generator</module>
   </modules>
 </project>

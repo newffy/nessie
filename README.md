@@ -71,12 +71,15 @@ docker run -p 19120:19120 -e QUARKUS_OIDC_CLIENT_ID=<Client ID> -e QUARKUS_OIDC_
 
 ### Installation
 
-Clone this repository and run maven:
+Clone this repository:
 ```bash
 git clone https://github.com/projectnessie/nessie
 cd nessie
-./mvnw clean install
 ```
+
+Then open the project in IntelliJ or Eclipse, or just use the IDEs to clone this github repository.
+
+Refer to [CONTRIBUTING](./CONTRIBUTING.md) for build instructions.
 
 ### Compatibility
 
@@ -84,14 +87,14 @@ Nessie Iceberg's integration is compatible with Iceberg as in the following tabl
 
 | Nessie version | Iceberg version | Spark version | Hive version | Flink version |
 |----------------|-----------------|---------------|--------------|---------------|
-| 0.20.1         | 0.13.1          | 3.0.X, 3.1.X  | 2.3.9        | 1.12.1        |
+| 0.21.2         | 0.13.1          | 3.0.X, 3.1.X  | 2.3.9        | 1.12.1        |
 | 0.9.2          | 0.12.1, 0.12.0  | 3.0.X, 3.1.X  | 2.3.9        | 1.12.1        |
 
 Nessie Delta Lake's integration is compatible with Delta Lake as in the following table:
 
 | Nessie version | Delta Lake version              | Spark version | 
 |----------------|---------------------------------|---------------|
-| 0.20.1         | [Custom](#delta-lake-artifacts) | 3.2.X         | 
+| 0.21.2         | [Custom](#delta-lake-artifacts) | 3.2.X         | 
 | 0.9.2          | [Custom](#delta-lake-artifacts) | 3.1.X         | 
 
 #### Delta Lake artifacts
@@ -126,6 +129,13 @@ are specified as per https://github.com/eclipse/microprofile-config/blob/master/
 ### AWS Lambda
 You can also deploy to AWS lambda function by following the steps in `servers/lambda/README.md`
  
+
+## Nessie related repositories
+
+* [Nessie Demos](https://github.com/projectnessie/nessie-demos): Demos for Nessie
+* [CEL Java](https://github.com/projectnessie/cel-java): Java port of the Common Expression Language
+* [Nessie antlr runtime](https://github.com/projectnessie/nessie-antlr-runtime): Shaded/relocated antlr runtime for Nessie Spark Extensions
+* [Nessie apprunner](https://github.com/projectnessie/nessie-apprunner): Maven and Gradle plugins to use Nessie in integration tests.
 
 ## Contributing
 

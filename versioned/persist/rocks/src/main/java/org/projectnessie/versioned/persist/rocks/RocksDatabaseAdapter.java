@@ -26,6 +26,7 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -132,7 +133,7 @@ public class RocksDatabaseAdapter
   }
 
   @Override
-  protected GlobalStatePointer fetchGlobalPointer(NonTransactionalOperationContext ctx) {
+  protected GlobalStatePointer doFetchGlobalPointer(NonTransactionalOperationContext ctx) {
     try {
       byte[] serialized = db.get(dbInstance.getCfGlobalPointer(), globalPointerKey());
       return serialized != null ? GlobalStatePointer.parseFrom(serialized) : null;
@@ -142,7 +143,7 @@ public class RocksDatabaseAdapter
   }
 
   @Override
-  protected void writeIndividualCommit(NonTransactionalOperationContext ctx, CommitLogEntry entry)
+  protected void doWriteIndividualCommit(NonTransactionalOperationContext ctx, CommitLogEntry entry)
       throws ReferenceConflictException {
     Lock lock = dbInstance.getLock().writeLock();
     lock.lock();
@@ -158,7 +159,7 @@ public class RocksDatabaseAdapter
   }
 
   @Override
-  protected void writeMultipleCommits(
+  protected void doWriteMultipleCommits(
       NonTransactionalOperationContext ctx, List<CommitLogEntry> entries) {
     Lock lock = dbInstance.getLock().writeLock();
     lock.lock();
@@ -177,7 +178,8 @@ public class RocksDatabaseAdapter
   }
 
   @Override
-  protected void writeGlobalCommit(NonTransactionalOperationContext ctx, GlobalStateLogEntry entry)
+  protected void doWriteGlobalCommit(
+      NonTransactionalOperationContext ctx, GlobalStateLogEntry entry)
       throws ReferenceConflictException {
     Lock lock = dbInstance.getLock().writeLock();
     lock.lock();
@@ -203,7 +205,7 @@ public class RocksDatabaseAdapter
   }
 
   @Override
-  protected boolean globalPointerCas(
+  protected boolean doGlobalPointerCas(
       NonTransactionalOperationContext ctx,
       GlobalStatePointer expected,
       GlobalStatePointer newPointer) {
@@ -225,7 +227,7 @@ public class RocksDatabaseAdapter
   }
 
   @Override
-  protected void cleanUpCommitCas(
+  protected void doCleanUpCommitCas(
       NonTransactionalOperationContext ctx,
       Hash globalId,
       Set<Hash> branchCommits,
@@ -252,7 +254,26 @@ public class RocksDatabaseAdapter
   }
 
   @Override
-  protected GlobalStateLogEntry fetchFromGlobalLog(NonTransactionalOperationContext ctx, Hash id) {
+  protected void doCleanUpGlobalLog(
+      NonTransactionalOperationContext ctx, Collection<Hash> globalIds) {
+    Lock lock = dbInstance.getLock().writeLock();
+    lock.lock();
+    try {
+      WriteBatch batch = new WriteBatch();
+      for (Hash h : globalIds) {
+        batch.delete(dbInstance.getCfGlobalLog(), dbKey(h));
+      }
+      db.write(new WriteOptions(), batch);
+    } catch (RocksDBException e) {
+      throw new RuntimeException(e);
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  @Override
+  protected GlobalStateLogEntry doFetchFromGlobalLog(
+      NonTransactionalOperationContext ctx, Hash id) {
     try {
       byte[] v = db.get(dbInstance.getCfGlobalLog(), dbKey(id));
       return v != null ? GlobalStateLogEntry.parseFrom(v) : null;
@@ -262,7 +283,7 @@ public class RocksDatabaseAdapter
   }
 
   @Override
-  protected CommitLogEntry fetchFromCommitLog(NonTransactionalOperationContext ctx, Hash hash) {
+  protected CommitLogEntry doFetchFromCommitLog(NonTransactionalOperationContext ctx, Hash hash) {
     try {
       byte[] v = db.get(dbInstance.getCfCommitLog(), dbKey(hash));
       return protoToCommitLogEntry(v);
@@ -272,14 +293,14 @@ public class RocksDatabaseAdapter
   }
 
   @Override
-  protected List<CommitLogEntry> fetchPageFromCommitLog(
+  protected List<CommitLogEntry> doFetchMultipleFromCommitLog(
       NonTransactionalOperationContext ctx, List<Hash> hashes) {
     return fetchPage(
         dbInstance.getCfCommitLog(), hashes, ProtoSerialization::protoToCommitLogEntry);
   }
 
   @Override
-  protected List<GlobalStateLogEntry> fetchPageFromGlobalLog(
+  protected List<GlobalStateLogEntry> doFetchPageFromGlobalLog(
       NonTransactionalOperationContext ctx, List<Hash> hashes) {
     return fetchPage(
         dbInstance.getCfGlobalLog(),
@@ -309,7 +330,7 @@ public class RocksDatabaseAdapter
   }
 
   @Override
-  protected void writeKeyListEntities(
+  protected void doWriteKeyListEntities(
       NonTransactionalOperationContext ctx, List<KeyListEntity> newKeyListEntities) {
     Lock lock = dbInstance.getLock().writeLock();
     lock.lock();
@@ -326,7 +347,7 @@ public class RocksDatabaseAdapter
   }
 
   @Override
-  protected Stream<KeyListEntity> fetchKeyLists(
+  protected Stream<KeyListEntity> doFetchKeyLists(
       NonTransactionalOperationContext ctx, List<Hash> keyListsIds) {
     try {
       List<ColumnFamilyHandle> cf = new ArrayList<>(keyListsIds.size());
@@ -347,7 +368,7 @@ public class RocksDatabaseAdapter
   }
 
   @Override
-  protected RepoDescription fetchRepositoryDescription(NonTransactionalOperationContext ctx) {
+  protected RepoDescription doFetchRepositoryDescription(NonTransactionalOperationContext ctx) {
     try {
       byte[] bytes = db.get(dbInstance.getCfRepoProps(), globalPointerKey());
       return bytes != null ? protoToRepoDescription(bytes) : null;
@@ -357,7 +378,7 @@ public class RocksDatabaseAdapter
   }
 
   @Override
-  protected boolean tryUpdateRepositoryDescription(
+  protected boolean doTryUpdateRepositoryDescription(
       NonTransactionalOperationContext ctx, RepoDescription expected, RepoDescription updateTo) {
     Lock lock = dbInstance.getLock().writeLock();
     lock.lock();
@@ -388,7 +409,7 @@ public class RocksDatabaseAdapter
   }
 
   @Override
-  protected void writeRefLog(NonTransactionalOperationContext ctx, AdapterTypes.RefLogEntry entry)
+  protected void doWriteRefLog(NonTransactionalOperationContext ctx, AdapterTypes.RefLogEntry entry)
       throws ReferenceConflictException {
     Lock lock = dbInstance.getLock().writeLock();
     lock.lock();
@@ -404,7 +425,7 @@ public class RocksDatabaseAdapter
   }
 
   @Override
-  protected RefLog fetchFromRefLog(NonTransactionalOperationContext ctx, Hash refLogId) {
+  protected RefLog doFetchFromRefLog(NonTransactionalOperationContext ctx, Hash refLogId) {
     if (refLogId == null) {
       // set the current head as refLogId
       refLogId = Hash.of(fetchGlobalPointer(ctx).getRefLogId());
@@ -418,7 +439,7 @@ public class RocksDatabaseAdapter
   }
 
   @Override
-  protected List<RefLog> fetchPageFromRefLog(
+  protected List<RefLog> doFetchPageFromRefLog(
       NonTransactionalOperationContext ctx, List<Hash> hashes) {
     return fetchPage(dbInstance.getCfRefLog(), hashes, ProtoSerialization::protoToRefLog);
   }

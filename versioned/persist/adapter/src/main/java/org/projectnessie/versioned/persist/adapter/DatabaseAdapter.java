@@ -15,6 +15,7 @@
  */
 package org.projectnessie.versioned.persist.adapter;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.ByteString;
 import java.util.Collection;
 import java.util.List;
@@ -22,7 +23,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
-import java.util.function.ToIntFunction;
 import java.util.stream.Stream;
 import org.projectnessie.versioned.BranchName;
 import org.projectnessie.versioned.Diff;
@@ -295,7 +295,7 @@ public interface DatabaseAdapter {
    *
    * <p>This operation is primarily used by Nessie-GC and must not be exposed via a public API.
    */
-  Stream<ContentIdWithType> globalKeys(ToIntFunction<ByteString> contentTypeExtractor);
+  Stream<ContentId> globalKeys();
 
   /**
    * Retrieve all global-content recorded in the global-content-log for the given keys +
@@ -303,18 +303,17 @@ public interface DatabaseAdapter {
    *
    * <p>This operation is primarily used by Nessie-GC and must not be exposed via a public API.
    */
-  Stream<ContentIdAndBytes> globalContent(
-      Set<ContentId> keys, ToIntFunction<ByteString> contentTypeExtractor);
+  Stream<ContentIdAndBytes> globalContent(Set<ContentId> keys);
 
   /**
    * Retrieves the global content for the given contents-id.
    *
    * @param contentId contents-id to retrieve the global content for
-   * @param contentTypeExtractor function to extract the content-type
    * @return global content, if present or an empty optional, never {@code null}.
    */
-  Optional<ContentIdAndBytes> globalContent(
-      ContentId contentId, ToIntFunction<ByteString> contentTypeExtractor);
+  Optional<ContentIdAndBytes> globalContent(ContentId contentId);
+
+  Map<String, Map<String, String>> repoMaintenance(RepoMaintenanceParams repoMaintenanceParams);
 
   /**
    * Retrieve the refLog starting at the refLog referenced by {@code offset}.
@@ -323,4 +322,7 @@ public interface DatabaseAdapter {
    * @param offset initial reflog id to read from
    */
   Stream<RefLog> refLog(Hash offset) throws RefLogNotFoundException;
+
+  @VisibleForTesting
+  void assertCleanStateForTests();
 }

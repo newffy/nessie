@@ -22,7 +22,7 @@
   <parent>
     <groupId>org.projectnessie</groupId>
     <artifactId>nessie-versioned</artifactId>
-    <version>0.20.2-SNAPSHOT</version>
+    <version>0.21.3-SNAPSHOT</version>
   </parent>
 
   <artifactId>nessie-versioned-persist</artifactId>
@@ -32,6 +32,7 @@
 
   <modules>
     <module>adapter</module>
+    <module>serialize-proto</module>
     <module>serialize</module>
     <module>nontx</module>
     <module>inmem</module>
@@ -41,6 +42,19 @@
     <module>tx</module>
     <module>store</module>
     <module>tests</module>
-    <module>bench</module>
   </modules>
+
+  <profiles>
+    <profile>
+      <id>build-all</id>
+      <activation>
+        <property>
+          <name>!quickly</name>
+        </property>
+      </activation>
+      <modules>
+        <module>bench</module>
+      </modules>
+    </profile>
+  </profiles>
 </project>

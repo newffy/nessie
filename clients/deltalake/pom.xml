@@ -22,7 +22,7 @@
   <parent>
     <groupId>org.projectnessie</groupId>
     <artifactId>nessie-clients</artifactId>
-    <version>0.20.2-SNAPSHOT</version>
+    <version>0.21.3-SNAPSHOT</version>
   </parent>
 
   <artifactId>nessie-deltalake</artifactId>
@@ -72,6 +72,12 @@
       <groupId>io.delta</groupId>
       <artifactId>delta-core_2.12</artifactId>
       <version>${deltalake.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.projectnessie</groupId>
+      <artifactId>nessie-spark-3.2-extensions</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>com.fasterxml.jackson.module</groupId>
@@ -207,7 +213,6 @@
       <plugin>
         <groupId>org.projectnessie</groupId>
         <artifactId>nessie-apprunner-maven-plugin</artifactId>
-        <version>${project.version}</version>
         <configuration>
           <skip>${skipITs}</skip>
           <systemProperties>

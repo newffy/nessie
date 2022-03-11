@@ -161,7 +161,7 @@ public abstract class AbstractRestCommitLog extends AbstractRestAssign {
         getApi()
             .getCommitLog()
             .refName(branch.getName())
-            .filter("commit.author == 'author-3' && commit.committer == ''")
+            .filter("commit.author == 'author-3'")
             .get();
     assertThat(log).isNotNull();
     assertThat(log.getLogEntries()).hasSize(commitsPerAuthor);
@@ -394,7 +394,9 @@ public abstract class AbstractRestCommitLog extends AbstractRestAssign {
             .collect(Collectors.toList());
     List<CommitMeta> completeLog =
         StreamingUtil.getCommitLogStream(
-                getApi(), branch.getName(), null, null, null, OptionalInt.of(pageSizeHint), false)
+                getApi(),
+                c -> c.refName(branch.getName()).fetch(FetchOption.MINIMAL),
+                OptionalInt.of(pageSizeHint))
             .map(LogEntry::getCommitMeta)
             .collect(Collectors.toList());
     assertThat(completeLog.stream().map(CommitMeta::getMessage))
@@ -432,7 +434,9 @@ public abstract class AbstractRestCommitLog extends AbstractRestAssign {
 
     List<CommitMeta> completeLog =
         StreamingUtil.getCommitLogStream(
-                getApi(), branch.getName(), null, null, null, OptionalInt.of(pageSizeHint), false)
+                getApi(),
+                c -> c.refName(branch.getName()).fetch(FetchOption.MINIMAL),
+                OptionalInt.of(pageSizeHint))
             .map(LogEntry::getCommitMeta)
             .collect(Collectors.toList());
     assertEquals(

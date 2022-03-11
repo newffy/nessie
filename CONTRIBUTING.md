@@ -31,14 +31,31 @@ on the new feature or improvement.
 
 ## Code changes
 
+### IntelliJ IDEA tips
+
+Nessie uses antlr and protoc to generate source files. Those files are needed to build the Nessie project.
+
+Tip: In the "Project" view (usually on the left) right-click on the `[nessie]` project, open the
+`Maven` sub-menu (at the bottom of the context menu), click on `Generate Sources and Update Folders`.
+This will generate the protobuf source files that are necessary to build Nessie via IntelliJ IDEA.
+
+Note: Using the above method via the project's context menu is much quicker than running/clicking on
+`Generate Sources and Update Folders for all projects` from the Maven view (usually on the right).
+
 ### Maven tips
 
 A `./mvnw --threads 1C clean install` runs basically "everything" except release/deployment stuff. This is often
 not necessary. Use one of these parameters to speed things up:
 
-* `-Dquickly` Just compiles code, no tests, does not build code under `ui/` and `perftest/`.
+* `-Dquickly` Just compiles code, no tests, does not build code under `ui/`, `perftest/` and a few more.
 * `-DskipTests` Compiles everything, runs no tests.
 * `-DskipITs` Compiles everything, runs unit tests, but no integration tests.
+
+#### Parallel Maven Builds
+
+Building Nessie works fine with Maven Daemon [`mvnd`](https://github.com/apache/maven-mvnd).
+
+Alternatively, use the provided Maven Wrapper `./mvnw` with the `-T1C` (or `--threads 1C`) option.
 
 ### Development process
 
